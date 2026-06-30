@@ -511,11 +511,7 @@ fn format_file_size(bytes: u64) -> String {
 /// `stage` goes from 0 to `total` (inclusive).
 fn print_progress_bar(stage: usize, total: usize, label: &str) {
     let bar_width = 20;
-    let filled = if total > 0 {
-        (stage * bar_width) / total
-    } else {
-        0
-    };
+    let filled = (stage * bar_width).checked_div(total).unwrap_or(0);
     let empty = bar_width - filled;
     let pct = if total > 0 { (stage * 100) / total } else { 0 };
     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
