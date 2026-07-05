@@ -269,3 +269,7 @@ ipfs_log/iface.rs → traits.rs
 - **Pre-release**: `v1.0.0-alpha.1` (Publishes only on GitHub)
 - **Beta**:  `v1.0.0-beta.1` (Publishes only on GitHub)
 - **Release Candidate**: `v1.0.0-rc.1` (Publishes only on GitHub)
+## Maintenance update 2026-07-05T20:26:28Z
+
+- Updated repository maintenance notes.
+
