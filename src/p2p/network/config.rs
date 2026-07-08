@@ -4,7 +4,6 @@
 // Focuses on iroh-blobs (storage) and iroh-gossip (pubsub).
 // Uses discovery via Pkarr/DNS/mDNS.
 
-use iroh::EndpointId as NodeId;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -21,8 +20,12 @@ pub struct ClientConfig {
     /// Port for the Iroh endpoint (0 = random port).
     pub port: u16,
 
-    /// Known peers to connect to initially.
-    pub known_peers: Vec<NodeId>,
+    /// Bootstrap peer addresses to register on the endpoint at startup, bypassing
+    /// any discovery service. Each entry carries the peer's [`NodeId`] plus its
+    /// reachable transport addresses, so peers can rendezvous purely from static
+    /// configuration (no dependency on n0.computer's public discovery/relay
+    /// infrastructure, mDNS, or a manual `add_node_addr` call after construction).
+    pub known_peers: Vec<iroh::EndpointAddr>,
 
     /// Enables discovery via n0.computer (Pkarr + DNS).
     pub enable_discovery_n0: bool,
@@ -112,9 +115,12 @@ impl ClientConfig {
         }
     }
 
-    /// Adds a known peer for the initial connection.
-    pub fn add_known_peer(&mut self, peer: NodeId) {
-        if !self.known_peers.contains(&peer) {
+    /// Adds a known peer address for the initial connection, bypassing discovery.
+    /// If the peer's `NodeId` is already present, its address is updated.
+    pub fn add_known_peer(&mut self, peer: iroh::EndpointAddr) {
+        if let Some(existing) = self.known_peers.iter_mut().find(|p| p.id == peer.id) {
+            *existing = peer;
+        } else {
             self.known_peers.push(peer);
         }
     }
@@ -419,16 +425,17 @@ mod tests {
 
     #[test]
     fn test_add_known_peer() {
-        use iroh::SecretKey;
+        use iroh::{EndpointAddr, SecretKey};
 
         let mut config = ClientConfig::default();
         let secret = SecretKey::generate();
-        let peer = secret.public();
+        let peer_id = secret.public();
+        let peer = EndpointAddr::new(peer_id);
 
-        config.add_known_peer(peer);
-        assert!(config.known_peers.contains(&peer));
+        config.add_known_peer(peer.clone());
+        assert!(config.known_peers.iter().any(|p| p.id == peer_id));
 
-        // Should not duplicate.
+        // Should not duplicate; re-adding the same NodeId updates in place.
         config.add_known_peer(peer);
         assert_eq!(config.known_peers.len(), 1);
     }

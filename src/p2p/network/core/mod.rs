@@ -9,7 +9,8 @@ use crate::guardian::error::{GuardianError, Result};
 use crate::p2p::network::{config::ClientConfig, types::*};
 use bytes::Bytes;
 use iroh::SecretKey;
-use iroh::endpoint::Endpoint;
+use iroh::address_lookup::memory::MemoryLookup;
+use iroh::endpoint::{Endpoint, presets};
 use iroh::protocol::Router;
 use iroh::{EndpointAddr as NodeAddr, EndpointId as NodeId};
 use iroh_blobs::api::Tag;
@@ -130,7 +131,6 @@ enum StoreType {
 /// - Continuous performance monitoring
 pub struct IrohBackend {
     /// Backend configuration.
-    #[allow(dead_code)]
     config: ClientConfig,
     /// Node data directory.
     data_dir: PathBuf,
@@ -529,25 +529,64 @@ impl IrohBackend {
             *store_lock = Some(StoreType::Fs(fs_store));
         }
 
-        // Initialize the Endpoint for P2P communication with native address lookup services.
-        // Iroh 1.0 uses the N0 preset, which enables DNS + Pkarr discovery via n0.computer (global).
-        // Local mDNS discovery (LAN) is added after binding via iroh-mdns-address-lookup.
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        // Initialize the Endpoint for P2P communication, respecting the configured
+        // discovery settings rather than always depending on n0.computer's public
+        // infrastructure. This matters for private/local-first/air-gapped
+        // deployments (and for embedding apps that run their own transport) where
+        // outbound access to n0.computer is unavailable or undesired.
+        //
+        // - enable_discovery_n0=true:  N0 preset (DNS + Pkarr discovery, default relay).
+        // - enable_discovery_n0=false: Minimal preset (crypto provider only, no
+        //   address lookup, relay disabled) - purely local/direct connectivity.
+        let builder = if self.config.enable_discovery_n0 {
+            Endpoint::builder(presets::N0)
+        } else {
+            Endpoint::builder(presets::Minimal)
+        };
+        let endpoint = builder
             .secret_key(self.secret_key.clone())
             .bind()
             .await
             .map_err(|e| GuardianError::Other(format!("Error initializing Endpoint: {}", e)))?;
 
-        // mDNS discovery on the local network (LAN), equivalent to the former discovery_local_network().
-        match MdnsAddressLookup::builder().build(endpoint.id()) {
-            Ok(mdns) => match endpoint.address_lookup() {
+        // Local mDNS discovery (LAN), equivalent to the former discovery_local_network().
+        // Only enabled when configured - some deployments (offline/tests/private
+        // networks) explicitly disable it to avoid multicast traffic or reliance
+        // on LAN discovery working in the runtime environment (e.g. containers).
+        if self.config.enable_discovery_mdns {
+            match MdnsAddressLookup::builder().build(endpoint.id()) {
+                Ok(mdns) => match endpoint.address_lookup() {
+                    Ok(services) => {
+                        services.add(mdns);
+                        debug!("Local mDNS discovery (LAN) enabled");
+                    }
+                    Err(e) => warn!("Address lookup unavailable for mDNS: {}", e),
+                },
+                Err(e) => warn!("Could not start local mDNS discovery: {}", e),
+            }
+        } else {
+            debug!("Local mDNS discovery (LAN) disabled by configuration");
+        }
+
+        // Register any statically configured bootstrap peer addresses so nodes can
+        // rendezvous purely from config, without depending on any discovery
+        // service or a manual add_node_addr() call after construction. This uses
+        // the same MemoryLookup mechanism as IrohClient::add_node_addr.
+        if !self.config.known_peers.is_empty() {
+            match endpoint.address_lookup() {
                 Ok(services) => {
-                    services.add(mdns);
-                    debug!("Local mDNS discovery (LAN) enabled");
+                    let lookup = MemoryLookup::new();
+                    for peer in &self.config.known_peers {
+                        lookup.add_endpoint_info(peer.clone());
+                    }
+                    services.add(lookup);
+                    debug!(
+                        "Registered {} statically configured bootstrap peer(s)",
+                        self.config.known_peers.len()
+                    );
                 }
-                Err(e) => warn!("Address lookup unavailable for mDNS: {}", e),
-            },
-            Err(e) => warn!("Could not start local mDNS discovery: {}", e),
+                Err(e) => warn!("Address lookup unavailable for known_peers: {}", e),
+            }
         }
 
         // Store the endpoint.
