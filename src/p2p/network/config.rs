@@ -8,6 +8,29 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Relay-server override: controls how the endpoint falls back to a relayed
+/// connection when a direct (hole-punched) QUIC path cannot be established.
+///
+/// `ClientConfig.relay = None` (the default) derives relay behavior from
+/// `enable_discovery_n0`: n0.computer's production relay servers when
+/// discovery is enabled, no relay at all when it is disabled - this preserves
+/// existing behavior for every config profile below. Set this explicitly to
+/// run against self-hosted relay infrastructure (or to force-enable/disable
+/// relay) independently of the discovery setting - e.g. n0's DNS discovery
+/// with a private relay fleet, or no discovery at all (static `known_peers`)
+/// but still with NAT-traversal fallback via your own relay.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RelayConfig {
+    /// No relay fallback; only direct (hole-punched) connections are possible.
+    Disabled,
+    /// n0.computer's production relay servers.
+    N0Default,
+    /// n0.computer's staging relay servers.
+    N0Staging,
+    /// One or more self-hosted relay server URLs, e.g. `https://relay.example.com`.
+    Custom(Vec<String>),
+}
+
 /// Complete configuration for the Iroh client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
@@ -33,6 +56,11 @@ pub struct ClientConfig {
     /// Enables discovery via mDNS (local network).
     pub enable_discovery_mdns: bool,
 
+    /// Explicit relay-server override. See [`RelayConfig`]. `None` derives
+    /// relay behavior from `enable_discovery_n0` (existing behavior).
+    #[serde(default)]
+    pub relay: Option<RelayConfig>,
+
     /// Iroh networking settings.
     pub network: NetworkConfig,
 
@@ -52,6 +80,7 @@ impl Default for ClientConfig {
             known_peers: vec![],
             enable_discovery_n0: true,   // Discovery via Pkarr/DNS.
             enable_discovery_mdns: true, // Local discovery.
+            relay: None,
             network: NetworkConfig::default(),
             storage: StorageConfig::default(),
             gossip: GossipConfig::default(),
@@ -69,6 +98,7 @@ impl ClientConfig {
             known_peers: vec![],
             enable_discovery_n0: false,  // Disabled for local dev.
             enable_discovery_mdns: true, // Local discovery only.
+            relay: None,
             network: NetworkConfig::development(),
             storage: StorageConfig::development(),
             gossip: GossipConfig::development(),
@@ -84,6 +114,7 @@ impl ClientConfig {
             known_peers: vec![],         // Would be populated with peers.
             enable_discovery_n0: true,   // Global discovery via n0.computer.
             enable_discovery_mdns: true, // Local discovery as well.
+            relay: None,
             network: NetworkConfig::production(),
             storage: StorageConfig::production(),
             gossip: GossipConfig::production(),
@@ -99,6 +130,7 @@ impl ClientConfig {
             known_peers: vec![],
             enable_discovery_n0: false,
             enable_discovery_mdns: false,
+            relay: None,
             network: NetworkConfig::testing(),
             storage: StorageConfig::testing(),
             gossip: GossipConfig::testing(),
@@ -137,6 +169,13 @@ impl ClientConfig {
         self
     }
 
+    /// Sets an explicit relay override, e.g. to point at self-hosted relay
+    /// infrastructure instead of n0.computer's default relay servers.
+    pub fn with_relay(mut self, relay: RelayConfig) -> Self {
+        self.relay = Some(relay);
+        self
+    }
+
     /// Validates the configuration.
     pub fn validate(&self) -> Result<(), String> {
         // Check the consistency of the Iroh configuration.
@@ -157,6 +196,20 @@ impl ClientConfig {
         // Validate the storage settings.
         if self.storage.max_cache_size == 0 {
             return Err("Cache size cannot be zero".to_string());
+        }
+
+        // Validate the relay override, if any.
+        if let Some(RelayConfig::Custom(urls)) = &self.relay {
+            if urls.is_empty() {
+                return Err("RelayConfig::Custom requires at least one relay URL (use \
+                     RelayConfig::Disabled for no relay)"
+                    .to_string());
+            }
+            for url in urls {
+                if let Err(e) = url.parse::<iroh::RelayUrl>() {
+                    return Err(format!("Invalid custom relay URL '{url}': {e}"));
+                }
+            }
         }
 
         Ok(())
@@ -444,6 +497,62 @@ mod tests {
     fn test_with_data_path() {
         let config = ClientConfig::default().with_data_path("/custom/path");
         assert_eq!(config.data_store_path, Some(PathBuf::from("/custom/path")));
+    }
+
+    #[test]
+    fn test_relay_defaults_to_none() {
+        // Every profile derives relay behavior from enable_discovery_n0 unless
+        // explicitly overridden.
+        assert_eq!(ClientConfig::default().relay, None);
+        assert_eq!(ClientConfig::development().relay, None);
+        assert_eq!(ClientConfig::production().relay, None);
+        assert_eq!(ClientConfig::testing().relay, None);
+        assert_eq!(ClientConfig::offline().relay, None);
+    }
+
+    #[test]
+    fn test_with_relay() {
+        let config = ClientConfig::default().with_relay(RelayConfig::Disabled);
+        assert_eq!(config.relay, Some(RelayConfig::Disabled));
+
+        let config = ClientConfig::default().with_relay(RelayConfig::Custom(vec![
+            "https://relay.example.com".to_string(),
+        ]));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_relay_custom_rejects_empty_list() {
+        let config = ClientConfig::default().with_relay(RelayConfig::Custom(vec![]));
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_relay_custom_rejects_invalid_url() {
+        let config =
+            ClientConfig::default().with_relay(RelayConfig::Custom(vec!["not a url".to_string()]));
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_relay_custom_accepts_valid_urls() {
+        let config = ClientConfig::default().with_relay(RelayConfig::Custom(vec![
+            "https://relay1.example.com".to_string(),
+            "https://relay2.example.com".to_string(),
+        ]));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_relay_disabled_and_n0_default_and_staging_are_valid() {
+        for relay in [
+            RelayConfig::Disabled,
+            RelayConfig::N0Default,
+            RelayConfig::N0Staging,
+        ] {
+            let config = ClientConfig::default().with_relay(relay);
+            assert!(config.validate().is_ok());
+        }
     }
 
     #[test]
