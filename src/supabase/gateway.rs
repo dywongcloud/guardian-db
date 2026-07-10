@@ -36,9 +36,19 @@ pub struct AppState<S: RelationalStorage> {
     pub schema_ready: Arc<tokio::sync::OnceCell<()>>,
     /// One-shot guard so the `storage` schema is bootstrapped on first use.
     pub storage_ready: Arc<tokio::sync::OnceCell<()>>,
+    /// One-shot guard so the `supabase_functions` schema is bootstrapped on
+    /// first use.
+    pub functions_ready: Arc<tokio::sync::OnceCell<()>>,
+    /// Lazily-constructed shared HTTP client for the Edge Functions
+    /// upstream-proxy mode (`ServiceConfig::functions_upstream`).
+    pub functions_http: Arc<tokio::sync::OnceCell<reqwest::Client>>,
     /// Shared realtime state (the broadcast bus between websocket subscribers
     /// and the id generator for connections / bindings).
     pub realtime: Arc<crate::supabase::realtime::RealtimeShared>,
+    /// In-flight TUS resumable-upload sessions.
+    pub tus: Arc<crate::supabase::tus::TusRegistry>,
+    /// The transactional-email transport (see [`ServiceConfig::mailer`]).
+    pub mailer: Arc<dyn crate::supabase::mailer::Mailer>,
 }
 
 impl<S: RelationalStorage> Clone for AppState<S> {
@@ -49,7 +59,11 @@ impl<S: RelationalStorage> Clone for AppState<S> {
             config: self.config.clone(),
             schema_ready: self.schema_ready.clone(),
             storage_ready: self.storage_ready.clone(),
+            functions_ready: self.functions_ready.clone(),
+            functions_http: self.functions_http.clone(),
             realtime: self.realtime.clone(),
+            tus: self.tus.clone(),
+            mailer: self.mailer.clone(),
         }
     }
 }
@@ -60,14 +74,28 @@ impl<S: RelationalStorage> AppState<S> {
         project: SupabaseCompatProject,
         config: ServiceConfig,
     ) -> Self {
+        let mailer = crate::supabase::mailer::build_mailer(&config.mailer);
         Self {
             db,
             project: Arc::new(project),
             config: Arc::new(config),
             schema_ready: Arc::new(tokio::sync::OnceCell::new()),
             storage_ready: Arc::new(tokio::sync::OnceCell::new()),
+            functions_ready: Arc::new(tokio::sync::OnceCell::new()),
+            functions_http: Arc::new(tokio::sync::OnceCell::new()),
             realtime: Arc::new(crate::supabase::realtime::RealtimeShared::new()),
+            tus: Arc::new(crate::supabase::tus::TusRegistry::new()),
+            mailer,
         }
+    }
+
+    /// Overrides the mailer transport (e.g. to inject a shared
+    /// [`crate::supabase::mailer::MemoryMailer`] a test wants to assert
+    /// against). Independent of `config.mailer`, which only affects the
+    /// transport [`AppState::new`] builds by default.
+    pub fn with_mailer(mut self, mailer: Arc<dyn crate::supabase::mailer::Mailer>) -> Self {
+        self.mailer = mailer;
+        self
     }
 }
 
@@ -150,21 +178,13 @@ pub fn build_router<S: RelationalStorage + 'static>(state: AppState<S>) -> Route
         // Realtime: browsers cannot set headers on websocket connects, so the
         // apikey arrives as a query parameter, verified inside the handler.
         .nest("/realtime/v1", crate::supabase::realtime::router::<S>())
-        .merge(stub_router::<S>())
+        // Functions: Kong does not apikey-gate this route (verify_jwt is a
+        // per-function registry setting, checked inside the handler), so it
+        // sits outside the apikey layer like realtime.
+        .nest("/functions/v1", crate::supabase::functions::router::<S>())
         .route("/health", any(health))
         .layer(axum::middleware::from_fn(request_id))
         .with_state(state)
-}
-
-/// The not-yet-implemented Kong services. Each returns a typed `501` (never a
-/// bare 404 and never fake success). These sit outside the apikey layer so the
-/// answer is a clear "not implemented" regardless of credentials.
-fn stub_router<S: RelationalStorage + 'static>() -> Router<AppState<S>> {
-    Router::new().route("/functions/v1/{*rest}", any(|| not_impl("FUNCTIONS")))
-}
-
-async fn not_impl(service: &'static str) -> Response {
-    SupaError::NotImplemented(service).into_response()
 }
 
 async fn health() -> Response {

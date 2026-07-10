@@ -79,16 +79,20 @@
 
 pub mod auth;
 pub mod error;
+pub mod functions;
 pub mod gateway;
 pub mod graphql;
 pub mod jwt;
+pub mod mailer;
 pub mod pg_meta;
 pub mod project;
 pub mod realtime;
 pub mod rest;
 pub mod storage;
+pub mod tus;
 
 pub use error::SupaError;
 pub use gateway::{AppState, build_router};
 pub use jwt::{Claims, JwtError};
+pub use mailer::{EmailMessage, EmailType, Mailer, MailerConfig, MemoryMailer};
 pub use project::{ProjectKeys, Secret, ServiceConfig, SupabaseCompatProject};
