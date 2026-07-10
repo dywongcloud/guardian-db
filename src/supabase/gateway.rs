@@ -174,6 +174,13 @@ pub fn build_router<S: RelationalStorage + 'static>(state: AppState<S>) -> Route
 
     Router::new()
         .merge(protected)
+        // Auth's credential-less surface: `GET|POST /auth/v1/verify` is the
+        // target of the link a browser follows straight out of a
+        // confirmation/recovery/magic-link email, which carries no `apikey`
+        // header. Disjoint from `router::<S>()`'s paths (only `/verify`
+        // here), so this coexists with the apikey-protected `/auth/v1` nest
+        // in `protected` above.
+        .nest("/auth/v1", crate::supabase::auth::open_router::<S>())
         .nest("/storage/v1", storage)
         // Realtime: browsers cannot set headers on websocket connects, so the
         // apikey arrives as a query parameter, verified inside the handler.

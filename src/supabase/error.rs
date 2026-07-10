@@ -37,6 +37,13 @@ pub enum SupaError {
     /// An engine error, rendered in PostgREST shape (`{code,message,details,hint}`)
     /// with the SQLSTATE as `code` and the SQLSTATE class mapped to the status.
     Sql(SqlError),
+    /// A transactional-email flow (signup confirmation, recovery, magic link,
+    /// resend) was invoked but no mailer transport is configured (see
+    /// [`crate::supabase::project::ServiceConfig::mailer`]).
+    MailerNotConfigured,
+    /// The configured mailer transport attempted delivery and failed. The
+    /// message is transport-safe (never a token, header, or body).
+    MailSend(String),
     /// An unexpected internal failure (never includes secrets).
     Internal(String),
 }
@@ -52,7 +59,9 @@ impl SupaError {
             SupaError::UnsupportedFilter(_) | SupaError::BadRequest(_) => StatusCode::BAD_REQUEST,
             SupaError::AuthProviderUnsupported(_) => StatusCode::BAD_REQUEST,
             SupaError::Sql(e) => status_for_sqlstate(e.sqlstate()),
-            SupaError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            SupaError::MailerNotConfigured | SupaError::MailSend(_) | SupaError::Internal(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         }
     }
 
@@ -70,6 +79,8 @@ impl SupaError {
                 "SUPA_COMPAT_AUTH_PROVIDER_UNSUPPORTED".to_string()
             }
             SupaError::Sql(e) => e.sqlstate().to_string(),
+            SupaError::MailerNotConfigured => "SUPA_COMPAT_AUTH_MAILER_NOT_CONFIGURED".to_string(),
+            SupaError::MailSend(_) => "SUPA_COMPAT_AUTH_MAIL_SEND_FAILED".to_string(),
             SupaError::Internal(_) => "SUPA_COMPAT_INTERNAL".to_string(),
         }
     }
@@ -97,6 +108,10 @@ impl SupaError {
                 format!("auth provider \"{p}\" is not supported")
             }
             SupaError::Sql(e) => e.to_string(),
+            SupaError::MailerNotConfigured => {
+                "no mailer transport is configured for this project".to_string()
+            }
+            SupaError::MailSend(m) => format!("failed to send email: {m}"),
             SupaError::Internal(m) => m.clone(),
         }
     }
@@ -110,7 +125,29 @@ impl SupaError {
             SupaError::AuthProviderUnsupported(_) => {
                 Some("only email/password auth is implemented in this slice".to_string())
             }
+            SupaError::MailerNotConfigured => Some(
+                "configure ServiceConfig::mailer (or --mailer-url / --mailer-log) to enable \
+                 email-dependent auth flows"
+                    .to_string(),
+            ),
             _ => None,
+        }
+    }
+}
+
+/// Maps a mailer transport failure to its typed gateway error. `NotConfigured`
+/// → [`SupaError::MailerNotConfigured`] (500); `TransportUnsupported` (only
+/// ever `"smtp"` in this slice, see [`crate::supabase::mailer::build_mailer`])
+/// → the existing [`SupaError::NotImplemented`] (typed 501); `Send` →
+/// [`SupaError::MailSend`] (500). Never a silent success or a bare failure.
+impl From<crate::supabase::mailer::MailError> for SupaError {
+    fn from(err: crate::supabase::mailer::MailError) -> Self {
+        match err {
+            crate::supabase::mailer::MailError::NotConfigured => SupaError::MailerNotConfigured,
+            crate::supabase::mailer::MailError::TransportUnsupported(_) => {
+                SupaError::NotImplemented("AUTH_SMTP")
+            }
+            crate::supabase::mailer::MailError::Send(s) => SupaError::MailSend(s),
         }
     }
 }
@@ -234,6 +271,46 @@ mod tests {
             body_json(SupaError::UnsupportedFilter("cs".into()).into_response()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "SUPA_COMPAT_REST_UNSUPPORTED_FILTER");
+    }
+
+    #[tokio::test]
+    async fn mailer_not_configured_shape() {
+        let (status, body) = body_json(SupaError::MailerNotConfigured.into_response()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["code"], "SUPA_COMPAT_AUTH_MAILER_NOT_CONFIGURED");
+        assert!(body["hint"].is_string());
+    }
+
+    #[tokio::test]
+    async fn mail_send_failed_shape() {
+        let (status, body) =
+            body_json(SupaError::MailSend("mail webhook returned 502".into()).into_response())
+                .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["code"], "SUPA_COMPAT_AUTH_MAIL_SEND_FAILED");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("mail webhook returned 502")
+        );
+    }
+
+    #[test]
+    fn mail_error_conversion_maps_to_typed_errors() {
+        use crate::supabase::mailer::MailError;
+        assert_eq!(
+            SupaError::from(MailError::NotConfigured),
+            SupaError::MailerNotConfigured
+        );
+        assert_eq!(
+            SupaError::from(MailError::TransportUnsupported("smtp")),
+            SupaError::NotImplemented("AUTH_SMTP")
+        );
+        assert_eq!(
+            SupaError::from(MailError::Send("boom".into())),
+            SupaError::MailSend("boom".into())
+        );
     }
 
     #[test]
