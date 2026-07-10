@@ -44,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut database = "app".to_string();
     let mut jwt_secret: Option<String> = None;
     let mut data_path: Option<String> = None;
+    let mut functions_upstream: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -52,6 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--database" | "-d" => database = args.next().unwrap_or(database),
             "--jwt-secret" => jwt_secret = args.next(),
             "--path" | "-p" => data_path = args.next(),
+            "--functions-upstream" => functions_upstream = args.next(),
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
@@ -70,7 +72,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let anon_key = keys.anon_key.clone();
     let service_role_key = keys.service_role_key.clone();
     let project = SupabaseCompatProject::shell(&database, &api_url, keys, Utc::now());
-    let config = ServiceConfig::default();
+    let config = ServiceConfig {
+        functions_upstream,
+        ..ServiceConfig::default()
+    };
 
     print_banner(
         &api_url,
@@ -143,9 +148,14 @@ fn print_help() {
     println!(
         "guardian-supabase — Supabase-compatible gateway for GuardianDB\n\n\
          Usage: guardian-supabase [--addr 127.0.0.1:54321] [--database app] \
-         [--jwt-secret <secret>] [--path <dir>]\n\n\
+         [--jwt-secret <secret>] [--path <dir>] [--functions-upstream <url>]\n\n\
          Without --path, an in-memory store is used (great for development).\n\
          With --path, a persistent Iroh-replicated GuardianDB node backs the gateway.\n\n\
+         Without --functions-upstream, /functions/v1 serves SQL-backed edge functions\n\
+         from the supabase_functions.functions registry (see docs). With\n\
+         --functions-upstream <url>, every /functions/v1 request (including OPTIONS\n\
+         and unknown slugs) is forwarded verbatim to a self-hosted Supabase Edge\n\
+         Runtime at <url> instead.\n\n\
          Point supabase-js at http://<addr> with the printed ANON_KEY."
     );
 }

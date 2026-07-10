@@ -10,9 +10,10 @@
 //! (GoTrue-compatible), **Storage** (storage-api-compatible, bytes in a
 //! replicated `bytea` table), **postgres-meta** (what Supabase Studio talks
 //! to), **Realtime** (Phoenix-protocol websocket) and **GraphQL**
-//! (pg_graphql-compatible schema reflection over the `public` schema). The
-//! remaining Kong service (functions) returns a typed `501 Not Implemented`
-//! error — never a bare 404 and never fake success.
+//! (pg_graphql-compatible schema reflection over the `public` schema) and
+//! **Edge Functions** (`/functions/v1`, SQL-backed invocation of
+//! `CREATE FUNCTION`-registered handlers, plus an optional upstream-proxy
+//! mode to a real Supabase Edge Runtime — no JS/WASM runtime of its own).
 //!
 //! ## Scouted seams (Stage 0)
 //!
@@ -70,7 +71,7 @@
 //!     ├─ /storage/v1/* → storage.rs  → Session(role) → storage.* tables (RLS)
 //!     ├─ /pg-meta/*    → pg_meta.rs  → catalog + pg_catalog views (service_role)
 //!     ├─ /realtime/v1/websocket → realtime.rs → Phoenix ws + change hook
-//!     └─ /functions    → 501 typed
+//!     └─ /functions/v1 → functions.rs → Session(role) → SQL UDF, or reqwest proxy
 //! ```
 //!
 //! Each request opens a fresh [`Session`] bound to the resolved role. A single

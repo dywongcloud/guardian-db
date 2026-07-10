@@ -209,37 +209,42 @@ pub async fn request_id(mut req: Request, next: Next) -> Response {
     resp
 }
 
-/// Verify the `apikey` (and optional bearer) against the project keys, resolve
-/// the effective role, and attach an [`AuthContext`].
-pub async fn require_apikey<S: RelationalStorage + 'static>(
-    State(state): State<AppState<S>>,
-    mut req: Request,
-    next: Next,
-) -> Response {
-    let now = Utc::now().timestamp();
-    let headers = req.headers();
-
+/// Verify the `apikey` (and optional bearer) against the project keys and
+/// resolve the effective role — the shared core of [`require_apikey`], also
+/// used directly by `/functions/v1` (whose `verify_jwt` gate is a per-function
+/// registry setting, not a blanket middleware layer; see
+/// [`crate::supabase::functions`]).
+pub(crate) async fn resolve_auth<S: RelationalStorage>(
+    state: &AppState<S>,
+    headers: &HeaderMap,
+    request_id: String,
+    now: i64,
+) -> Result<AuthContext, SupaError> {
     // The apikey header is required; Supabase clients also accept the apikey in
     // Authorization, so fall back to a bearer token when the header is absent.
     let apikey = header_str(headers, "apikey")
         .map(str::to_string)
         .or_else(|| bearer_token(headers).map(str::to_string));
     let Some(apikey) = apikey else {
-        return SupaError::MissingApiKey.into_response();
+        return Err(SupaError::MissingApiKey);
     };
-    let api_claims = match state.project.keys.verify_api_key(&apikey, now) {
-        Ok(c) => c,
-        Err(_) => return SupaError::InvalidApiKey.into_response(),
-    };
+    let api_claims = state
+        .project
+        .keys
+        .verify_api_key(&apikey, now)
+        .map_err(|_| SupaError::InvalidApiKey)?;
     let api_key_role = api_claims.pg_role().to_string();
 
     // A distinct Authorization bearer identifies the caller (anon token or a
     // real user access token). If present it must verify.
     let claims = match bearer_token(headers) {
-        Some(tok) => match state.project.keys.verify_api_key(tok, now) {
-            Ok(c) => Some(c),
-            Err(e) => return SupaError::InvalidJwt(e).into_response(),
-        },
+        Some(tok) => Some(
+            state
+                .project
+                .keys
+                .verify_api_key(tok, now)
+                .map_err(SupaError::InvalidJwt)?,
+        ),
         None => None,
     };
 
@@ -250,6 +255,22 @@ pub async fn require_apikey<S: RelationalStorage + 'static>(
         .map(|c| c.pg_role().to_string())
         .unwrap_or_else(|| api_key_role.clone());
 
+    Ok(AuthContext {
+        role,
+        api_key_role,
+        claims,
+        request_id,
+    })
+}
+
+/// Verify the `apikey` (and optional bearer) against the project keys, resolve
+/// the effective role, and attach an [`AuthContext`].
+pub async fn require_apikey<S: RelationalStorage + 'static>(
+    State(state): State<AppState<S>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let now = Utc::now().timestamp();
     let request_id = req
         .extensions()
         .get::<RequestId>()
@@ -257,13 +278,13 @@ pub async fn require_apikey<S: RelationalStorage + 'static>(
         .or_else(|| header_str(req.headers(), "x-request-id").map(str::to_string))
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    req.extensions_mut().insert(AuthContext {
-        role,
-        api_key_role,
-        claims,
-        request_id,
-    });
-    next.run(req).await
+    match resolve_auth(&state, req.headers(), request_id, now).await {
+        Ok(auth) => {
+            req.extensions_mut().insert(auth);
+            next.run(req).await
+        }
+        Err(e) => e.into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------

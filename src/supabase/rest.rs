@@ -986,7 +986,10 @@ fn infer_value(raw: &str) -> SqlValue {
 }
 
 /// Convert a JSON body value to a typed [`SqlValue`] for the target column.
-fn json_to_sqlvalue(v: &Json, ty: Option<&SqlType>) -> SqlValue {
+/// Also reused by `/functions/v1` to coerce named-argument bodies against a
+/// candidate function's declared parameter types (see
+/// `crate::supabase::functions::select_target`).
+pub(crate) fn json_to_sqlvalue(v: &Json, ty: Option<&SqlType>) -> SqlValue {
     if v.is_null() {
         return SqlValue::Null;
     }
