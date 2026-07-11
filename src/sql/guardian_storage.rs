@@ -25,11 +25,13 @@ use crate::guardian::GuardianDB;
 use crate::guardian::error::{GuardianError, Result as GuardianResult};
 use crate::relational::error::Result as RelResult;
 use crate::relational::{RelError, RelationalStorage};
-use crate::sql::engine::Database;
+use crate::sql::engine::{ChangeSource, Database, classify_change};
+use crate::stores::document_store::EventDocsDiff;
 use crate::traits::{Document, DocumentStore};
 use async_trait::async_trait;
 use serde_json::{Map, Value as Json};
 use std::sync::Arc;
+use tracing::warn;
 
 /// Separator between a collection prefix and a row id in the GuardianDB key.
 /// `0x1f` (unit separator) does not occur in the engine's row ids.
@@ -85,6 +87,16 @@ impl GuardianRelationalStorage {
     /// re-synced.
     pub async fn refresh(&self) -> GuardianResult<()> {
         self.store.load(0).await
+    }
+
+    /// The underlying document-store handle. An escape hatch below the
+    /// [`RelationalStorage`] abstraction for callers that need iroh-docs-level
+    /// access — e.g. tests fabricating a peer-authored write to exercise the
+    /// replicated-write realtime bridge (see `spawn_replication_bridge`),
+    /// which real replication would otherwise require a second networked peer
+    /// to produce.
+    pub fn document_store(&self) -> &Arc<dyn DocumentStore<Error = GuardianError>> {
+        &self.store
     }
 
     fn gkey(collection: &str, row_id: &str) -> String {
@@ -195,7 +207,106 @@ pub async fn open_sql_with(
 ) -> GuardianResult<Arc<Database<GuardianRelationalStorage>>> {
     let docs = db.docs(name, None).await?;
     let storage = Arc::new(GuardianRelationalStorage::new(docs).with_consistency(consistency));
-    Ok(Arc::new(Database::new(storage, name.to_string())))
+    let database = Arc::new(Database::new(storage, name.to_string()));
+    spawn_replication_bridge(&database).await;
+    Ok(database)
+}
+
+/// Bridges peer-authored (replicated) document-store writes into the
+/// engine's [`ChangeEvent`](crate::sql::engine::ChangeEvent) changefeed.
+///
+/// `Database::subscribe_changes` only observes commits made locally through a
+/// [`Session`](crate::sql::engine::Session) on this node — replicated writes
+/// land in the document store correctly but never reach that hook on their
+/// own. `GuardianDBDocumentStore::refresh_doc_index` (driven by
+/// `GuardianRelationalStorage::refresh` / the reactive live-sync task) diffs
+/// foreign-authored index changes and broadcasts them as [`EventDocsDiff`]
+/// batches on the store's [`EventBus`](crate::p2p::EventBus). This task
+/// subscribes to that broadcast, reclassifies each diff through the same
+/// [`classify_change`] logic local commits use (tagged
+/// [`ChangeSource::Replicated`]), and delivers the result through
+/// `database.emit_changes` — the exact channel local commits use, so realtime
+/// subscribers (`crate::supabase::realtime`) see both without special-casing.
+///
+/// Best-effort: if the store's event bus can't be subscribed to, this simply
+/// skips spawning (replicated changes then just aren't observed by realtime,
+/// same as before this bridge existed) rather than failing `open_sql_with`.
+/// Holds only a [`Weak`] reference to `database` so the bridge task can never
+/// keep the database (and its storage/iroh handles) alive after every
+/// external holder has dropped it.
+async fn spawn_replication_bridge(database: &Arc<Database<GuardianRelationalStorage>>) {
+    let store = database.storage().document_store();
+    let event_bus = store.event_bus();
+    let store_address = store.address().to_string();
+
+    let mut rx = match event_bus.subscribe::<EventDocsDiff>().await {
+        Ok(rx) => rx,
+        Err(e) => {
+            warn!(
+                "Failed to subscribe to replicated-write events for store '{}'; realtime \
+                 subscribers will not observe replicated writes on this store: {:?}",
+                store_address, e
+            );
+            return;
+        }
+    };
+
+    let weak_db = Arc::downgrade(database);
+
+    tokio::spawn(async move {
+        loop {
+            let diff = match rx.recv().await {
+                Ok(diff) => diff,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(
+                        "Replicated-write bridge for store '{}' lagged by {} events; some \
+                         replicated changes may not reach realtime subscribers",
+                        store_address, n
+                    );
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+
+            // Check for external holders before doing any work: once the
+            // last strong `Arc<Database<_>>` is gone, there's nothing left
+            // to deliver to, so stop the task.
+            let Some(database) = weak_db.upgrade() else {
+                break;
+            };
+
+            if diff.address != store_address {
+                continue;
+            }
+
+            let at = chrono::Utc::now();
+            let mut events = Vec::new();
+            for change in diff.changes {
+                let old_doc = change
+                    .old
+                    .as_deref()
+                    .and_then(|b| GuardianRelationalStorage::unwrap_doc(b).ok().flatten());
+                let new_doc = change
+                    .new
+                    .as_deref()
+                    .and_then(|b| GuardianRelationalStorage::unwrap_doc(b).ok().flatten());
+                match classify_change(
+                    old_doc.as_ref(),
+                    new_doc.as_ref(),
+                    at,
+                    ChangeSource::Replicated,
+                ) {
+                    Some(ev) => events.push(ev),
+                    None => tracing::trace!(
+                        key = %change.key,
+                        "replicated document diff for '{}' produced no observable row change (not a table row, or no liveness transition)",
+                        store_address
+                    ),
+                }
+            }
+            database.emit_changes(events);
+        }
+    });
 }
 
 #[cfg(test)]
