@@ -220,6 +220,23 @@ pub struct ServiceConfig {
     pub jwt_aud: String,
     /// Whether self-service signup is disabled.
     pub disable_signup: bool,
+    /// The transactional-email transport. Defaults to
+    /// [`crate::supabase::mailer::MailerConfig::Unconfigured`], matching the
+    /// pre-existing (mailer-less) behavior.
+    pub mailer: crate::supabase::mailer::MailerConfig,
+    /// Whether signup requires clicking a confirmation link before the account
+    /// can sign in. Defaults to `false`, preserving the existing
+    /// auto-confirm-on-signup behavior; setting this `true` without a
+    /// configured mailer makes signup fail typed rather than silently skip
+    /// confirmation.
+    pub require_email_confirmation: bool,
+    /// How long a confirmation / recovery / magic-link token remains valid, in
+    /// seconds (GoTrue `MAILER_OTP_EXP`, default 3600).
+    pub mailer_otp_exp: i64,
+    /// Base URL of a self-hosted Supabase Edge Runtime to proxy `/functions/v1`
+    /// requests to. `None` (the default) serves functions from the in-process
+    /// SQL-backed registry instead.
+    pub functions_upstream: Option<String>,
 }
 
 impl Default for ServiceConfig {
@@ -230,6 +247,10 @@ impl Default for ServiceConfig {
             refresh_token_ttl: 30 * 24 * 60 * 60,
             jwt_aud: "authenticated".to_string(),
             disable_signup: false,
+            mailer: crate::supabase::mailer::MailerConfig::default(),
+            require_email_confirmation: false,
+            mailer_otp_exp: 3600,
+            functions_upstream: None,
         }
     }
 }

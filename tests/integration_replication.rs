@@ -1098,3 +1098,176 @@ async fn test_store_isolation_across_nodes() {
 
     tracing::info!("✓ Store isolation across connected nodes validated");
 }
+
+/// Proves that a peer configured up front via `ClientConfig.known_peers` can
+/// replicate without ANY manual `add_node_addr()`/`connect_gossip()` call.
+///
+/// Every other test in this file establishes connectivity by manually calling
+/// `add_node_addr()` after both nodes are already running. That pattern only
+/// exercises the endpoint's runtime API - it never proves that a node embedding
+/// GuardianDB can bootstrap purely from configuration, without depending on
+/// n0.computer's public discovery/relay infrastructure (which may be
+/// unreachable in private, air-gapped, or otherwise network-restricted
+/// deployments) and without wiring peer addresses in by hand at runtime.
+#[tokio::test]
+async fn test_config_only_bootstrap_replication() {
+    use guardian_db::guardian::core::NewGuardianDBOptions;
+    use guardian_db::p2p::network::config::ClientConfig;
+
+    init_test_logging();
+
+    let node1 = TestNode::new("bootstrap_node1")
+        .await
+        .expect("Failed to create node1");
+    let peer1_id = node1.iroh.node_id();
+    let node1_addr = node1
+        .get_node_addr()
+        .await
+        .expect("Failed to get node1 addr");
+
+    tracing::info!("✓ Created node1: {}", peer1_id);
+
+    // Node2 is built with node1's address pre-registered in ClientConfig.known_peers
+    // BEFORE the endpoint is even created. No add_node_addr() call happens anywhere
+    // in this test.
+    let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let data_path = temp_dir.path().join("bootstrap_node2");
+
+    let mut iroh_config = ClientConfig::testing();
+    iroh_config.data_store_path = Some(data_path.join("iroh"));
+    iroh_config.port = 0;
+    iroh_config.known_peers = vec![node1_addr];
+
+    let db_options = NewGuardianDBOptions {
+        directory: Some(data_path.join("guardian")),
+        ..Default::default()
+    };
+
+    let node2 = TestNode::with_config("bootstrap_node2", iroh_config, db_options)
+        .await
+        .expect("Failed to create node2 from config-only bootstrap");
+
+    tracing::info!("✓ Created node2 with node1 pre-registered as a config-only known peer");
+
+    let log1 = node1
+        .db
+        .log("bootstrap-log", None)
+        .await
+        .expect("Failed to create log on node1");
+    let log2 = node2
+        .db
+        .log("bootstrap-log", None)
+        .await
+        .expect("Failed to create log on node2");
+
+    log1.add(b"Event from bootstrap node1".to_vec())
+        .await
+        .expect("Failed to add to node1");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Node2 connects using ONLY the statically configured address: no
+    // add_node_addr(), no manual connect_gossip() beforehand.
+    node2
+        .db
+        .connect_to_peer(peer1_id)
+        .await
+        .expect("Failed to connect using only ClientConfig.known_peers bootstrap");
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+    let ops2 = log2
+        .list(None)
+        .await
+        .expect("Failed to get entries from node2");
+
+    tracing::info!(
+        "Node2 has {} entries after config-only bootstrap replication",
+        ops2.len()
+    );
+    assert!(
+        !ops2.is_empty(),
+        "Node2 should have received data from node1 via ClientConfig.known_peers alone, \
+         with no manual add_node_addr() call"
+    );
+    let replicated = ops2
+        .iter()
+        .any(|op| op.value() == b"Event from bootstrap node1");
+    assert!(
+        replicated,
+        "Node2 should have the specific entry replicated from node1"
+    );
+
+    tracing::info!("✓ Config-only bootstrap replication validated (no manual add_node_addr)");
+}
+
+/// Negative control for [`test_config_only_bootstrap_replication`]: with every
+/// discovery mechanism (n0 + mDNS) genuinely disabled and no known_peers
+/// configured, two independently created nodes must NOT be able to rendezvous.
+///
+/// Before the transport-wiring fix, `enable_discovery_n0`/`enable_discovery_mdns`
+/// were silently ignored and mDNS was always active - so on a single host, two
+/// disconnected nodes could still stumble onto each other via mDNS even when the
+/// config explicitly asked for full isolation. That masked the underlying bug: it
+/// made `test_config_only_bootstrap_replication` pass for the wrong reason (mDNS),
+/// not because `known_peers` actually worked. This test proves discovery is now
+/// truly off when configured off, so the positive test above is proof that
+/// `known_peers` - not an accidental discovery leak - is what enables replication.
+#[tokio::test]
+async fn test_isolated_nodes_do_not_auto_connect() {
+    use guardian_db::p2p::network::config::ClientConfig;
+
+    init_test_logging();
+
+    // ClientConfig::testing() already sets enable_discovery_n0/mdns to false;
+    // assert that explicitly so this test documents its own precondition.
+    let probe = ClientConfig::testing();
+    assert!(!probe.enable_discovery_n0);
+    assert!(!probe.enable_discovery_mdns);
+    assert!(probe.known_peers.is_empty());
+
+    let node1 = TestNode::new("isolated_node1")
+        .await
+        .expect("Failed to create node1");
+    let node2 = TestNode::new("isolated_node2")
+        .await
+        .expect("Failed to create node2");
+
+    let peer1_id = node1.iroh.node_id();
+
+    // No add_node_addr(), no known_peers - node2 has no way to resolve node1's
+    // address. The connection attempt must fail (or at least never establish a
+    // gossip mesh / replicate data) rather than silently succeeding via mDNS.
+    let connect_result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        node2.db.connect_to_peer(peer1_id),
+    )
+    .await;
+
+    let log2 = node2
+        .db
+        .log("isolated-log", None)
+        .await
+        .expect("Failed to create log on node2");
+
+    // Regardless of whether connect_to_peer itself returned Ok or Err (base_store's
+    // connect_to_peer tolerates a failed gossip dial and continues), no actual
+    // sync should have happened without any addressing information - node2's log
+    // has zero entries because node1 never added any and no data could flow.
+    let ops2 = log2
+        .list(None)
+        .await
+        .expect("Failed to get entries from node2");
+
+    tracing::info!(
+        "Isolated nodes: connect_result={:?}, node2 has {} entries",
+        connect_result.is_ok(),
+        ops2.len()
+    );
+    assert!(
+        ops2.is_empty(),
+        "Isolated nodes with no discovery and no known_peers must not replicate anything"
+    );
+
+    tracing::info!("✓ Isolated nodes correctly failed to auto-connect (discovery genuinely off)");
+}

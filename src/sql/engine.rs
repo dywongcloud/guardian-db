@@ -47,13 +47,20 @@ impl<S: RelationalStorage> Database<S> {
     /// Subscribe to committed row changes. Every row mutation that reaches
     /// storage through a [`Session`] — autocommit statements and explicit
     /// `COMMIT`s alike — is delivered as a [`ChangeEvent`] *after* it has been
-    /// applied. Dropping the receiver unsubscribes (the sender is pruned on the
-    /// next emission). When no listener is registered the engine skips event
-    /// collection entirely, so the hook costs nothing unless used.
+    /// applied, tagged [`ChangeSource::Local`]. Dropping the receiver
+    /// unsubscribes (the sender is pruned on the next emission). When no
+    /// listener is registered the engine skips event collection entirely, so
+    /// the hook costs nothing unless used.
     ///
     /// `TRUNCATE` produces no per-row events, and writes that bypass the
-    /// engine (direct [`RelationalStorage`] calls, remote replication) are not
-    /// observed — this is a local-commit hook, not a replication changefeed.
+    /// engine (direct [`RelationalStorage`] calls) are not observed. A
+    /// GuardianDB-backed SQL database opened via
+    /// [`crate::sql::open_sql`]/[`crate::sql::open_sql_with`] additionally
+    /// bridges *replicated* (peer-authored) document-store writes into this
+    /// same channel, tagged [`ChangeSource::Replicated`] — those are observed
+    /// at refresh-interval granularity (whenever the underlying document
+    /// store's local index is re-synced, e.g. `GuardianRelationalStorage::refresh`
+    /// or the reactive live-sync task), not on the tight local-commit path.
     pub fn subscribe_changes(&self) -> tokio::sync::mpsc::UnboundedReceiver<ChangeEvent> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.change_listeners.write().unwrap().push(tx);
@@ -66,7 +73,10 @@ impl<S: RelationalStorage> Database<S> {
     }
 
     /// Deliver `events` to every registered listener, pruning closed ones.
-    fn emit_changes(&self, events: Vec<ChangeEvent>) {
+    /// `pub(crate)` so replication bridges outside this module (e.g.
+    /// `crate::sql::guardian_storage`'s replicated-write bridge task) can
+    /// reuse the same delivery path local commits use.
+    pub(crate) fn emit_changes(&self, events: Vec<ChangeEvent>) {
         if events.is_empty() {
             return;
         }
@@ -92,8 +102,23 @@ pub struct ChangeEvent {
     pub old: Option<Json>,
     /// The row document after the change (`INSERT` / `UPDATE`).
     pub new: Option<Json>,
-    /// When the local commit applied this change.
+    /// When the change was applied (local commit time, or the time the
+    /// replicated write was detected — see [`ChangeSource`]).
     pub commit_time: chrono::DateTime<chrono::Utc>,
+    /// Whether this change was committed locally or observed via replication.
+    pub source: ChangeSource,
+}
+
+/// Where a [`ChangeEvent`] originated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeSource {
+    /// Committed locally through a [`Session`] on this node.
+    Local,
+    /// Detected by diffing peer-authored document-store writes (arrived via
+    /// P2P replication) against the previous local index snapshot.
+    /// Delivered at refresh-interval granularity, not on the tight
+    /// local-commit path — see [`Database::subscribe_changes`].
+    Replicated,
 }
 
 /// The kind of row change a [`ChangeEvent`] describes.
@@ -1517,18 +1542,24 @@ impl<S: RelationalStorage> Session<S> {
     }
 }
 
-/// Classify one storage write as a [`ChangeEvent`] and append it to `events`.
-/// `old` is the stored document before the write (`None` when absent), `new`
-/// the document being written (`None` for a physical delete). Tombstoned rows
-/// (`__deleted: true`) count as absent, so a tombstoning put is a `DELETE` and
-/// re-inserting over a tombstone is an `INSERT`. Documents that are not table
-/// rows (no `__table` marker) produce no event.
-fn push_change(
-    events: &mut Vec<ChangeEvent>,
+/// Classify one storage write as a [`ChangeEvent`], or `None` if it produces
+/// no observable change. `old` is the stored document before the write
+/// (`None` when absent), `new` the document being written (`None` for a
+/// physical delete). Tombstoned rows (`__deleted: true`) count as absent, so
+/// a tombstoning put is a `DELETE` and re-inserting over a tombstone is an
+/// `INSERT`. Documents that are not table rows (no `__table` marker) produce
+/// no event.
+///
+/// Shared by the local-commit path ([`push_change`]) and the replicated-write
+/// bridge (`crate::sql::guardian_storage`'s diff-driven task), which is why
+/// the caller supplies `source` rather than this function assuming
+/// [`ChangeSource::Local`].
+pub(crate) fn classify_change(
     old: Option<&Json>,
     new: Option<&Json>,
     at: chrono::DateTime<chrono::Utc>,
-) {
+    source: ChangeSource,
+) -> Option<ChangeEvent> {
     use crate::sql::store::{F_DELETED, F_ID, F_SCHEMA, F_TABLE};
     // A fn item (not a closure) so the input/output lifetimes elide correctly.
     fn live(doc: Option<&Json>) -> Option<&Json> {
@@ -1542,31 +1573,42 @@ fn push_change(
     }
     let old_live = live(old);
     let new_live = live(new);
-    let (op, source) = match (old_live, new_live) {
+    let (op, doc_source) = match (old_live, new_live) {
         (None, Some(n)) => (ChangeOp::Insert, n),
         (Some(_), Some(n)) => (ChangeOp::Update, n),
         (Some(o), None) => (ChangeOp::Delete, o),
-        (None, None) => return,
+        (None, None) => return None,
     };
-    let Some(obj) = source.as_object() else {
-        return;
-    };
-    let Some(table) = obj.get(F_TABLE).and_then(Json::as_str) else {
-        return;
-    };
+    let obj = doc_source.as_object()?;
+    let table = obj.get(F_TABLE).and_then(Json::as_str)?;
     let schema = obj
         .get(F_SCHEMA)
         .and_then(Json::as_str)
         .unwrap_or("public")
         .to_string();
-    events.push(ChangeEvent {
+    Some(ChangeEvent {
         schema,
         table: table.to_string(),
         op,
         old: old_live.cloned(),
         new: new_live.cloned(),
         commit_time: at,
-    });
+        source,
+    })
+}
+
+/// Classify one locally-committed storage write and append it to `events`
+/// when it produces an observable change. Thin wrapper over
+/// [`classify_change`] fixing `source` to [`ChangeSource::Local`].
+fn push_change(
+    events: &mut Vec<ChangeEvent>,
+    old: Option<&Json>,
+    new: Option<&Json>,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    if let Some(ev) = classify_change(old, new, at, ChangeSource::Local) {
+        events.push(ev);
+    }
 }
 
 /// A hand-recognized `SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED |

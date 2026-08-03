@@ -19,7 +19,7 @@ use iroh_docs::{AuthorId, Capability, api::Doc, store::Query};
 use opentelemetry::trace::{TracerProvider, noop::NoopTracerProvider};
 use parking_lot::RwLock;
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{Span, debug, info, instrument, warn};
 
@@ -89,36 +89,140 @@ impl DocumentStoreIndex {
     }
 }
 
-/// Rebuilds the in-memory index from the current state of the iroh-docs document.
-/// Shared between `sync_index_from_docs` and the reactive live-sync task.
+/// One key's before/after state observed while rebuilding the index, for a
+/// key written by an author other than the store's own. Carries the raw
+/// wrapped-document bytes exactly as stored in the index (`None` = absent /
+/// tombstoned).
+#[derive(Clone, Debug)]
+pub(crate) struct DocChange {
+    pub key: String,
+    pub old: Option<Vec<u8>>,
+    pub new: Option<Vec<u8>>,
+}
+
+/// A batch of peer-authored [`DocChange`]s observed on one document store
+/// during a single [`refresh_doc_index`] pass, broadcast on the shared
+/// [`EventBus`] so higher layers (e.g. the SQL relational engine's realtime
+/// bridge) can turn replicated writes into change events. `address` lets
+/// subscribers filter to the store they care about — the bus is shared by
+/// every store opened on a given `GuardianDB` instance.
+#[derive(Clone, Debug)]
+pub(crate) struct EventDocsDiff {
+    pub address: String,
+    pub changes: Vec<DocChange>,
+}
+
+/// Rebuilds the in-memory index from the current state of the iroh-docs
+/// document. Shared between `sync_index_from_docs` and the reactive
+/// live-sync task.
+///
+/// While rebuilding, diffs entries authored by someone other than
+/// `local_author` against the previous index snapshot and, if any differ,
+/// broadcasts an [`EventDocsDiff`] on `event_bus` — this is how writes that
+/// arrived via P2P replication (invisible to the local-commit-only
+/// `Database::subscribe_changes` hook) get bridged into the realtime
+/// changefeed. Emission is best-effort: a failure to build an emitter or
+/// broadcast the diff is logged and does not fail the refresh.
 async fn refresh_doc_index(
     docs: &WillowDocs,
     doc: &Doc,
     client: &Arc<IrohClient>,
     index: &Arc<DocumentStoreIndex>,
+    local_author: AuthorId,
+    event_bus: &Arc<EventBus>,
+    address: &str,
 ) -> Result<usize> {
     let entries = docs
         .get_many(doc, Query::single_latest_per_key().build())
         .await?;
 
+    // Snapshot the pre-refresh state (via the existing synchronous index
+    // accessors) so foreign-authored entries can be diffed against it below.
+    let before: HashMap<String, Vec<u8>> = index
+        .keys()
+        .into_iter()
+        .filter_map(|k| index.get_value(&k).map(|v| (k, v)))
+        .collect();
+    let mut unseen: HashSet<String> = before.keys().cloned().collect();
+
     index.clear_all();
     let mut count = 0;
+    let mut changes = Vec::new();
 
     for entry in &entries {
         let key = String::from_utf8_lossy(entry.key()).to_string();
+        unseen.remove(&key);
+        let foreign = entry.author() != local_author;
 
         if entry.content_len() == 0 {
+            // A tombstone: no content to insert into the index. If a peer
+            // authored this delete and we previously had a value for the
+            // key, that's a replicated DELETE.
+            if foreign && let Some(prev) = before.get(&key) {
+                changes.push(DocChange {
+                    key,
+                    old: Some(prev.clone()),
+                    new: None,
+                });
+            }
             continue;
         }
 
         let hash_str = entry.content_hash().to_hex();
         match client.cat_bytes(&hash_str).await {
             Ok(value) => {
+                if foreign {
+                    let prev = before.get(&key);
+                    if prev != Some(&value) {
+                        changes.push(DocChange {
+                            key: key.clone(),
+                            old: prev.cloned(),
+                            new: Some(value.clone()),
+                        });
+                    }
+                }
                 index.insert(key, value);
                 count += 1;
             }
             Err(e) => {
                 warn!("Failed to read content for key from iroh-docs: {:?}", e);
+            }
+        }
+    }
+
+    // Keys present before the refresh but absent from this query's results
+    // entirely (not even as a zero-length tombstone entry). Willow normally
+    // keeps a tombstone entry per deleted key, so `single_latest_per_key()`
+    // should always still surface it (handled above); this is a defensive
+    // fallback for the case it doesn't (e.g. GC). The author of a vanished
+    // key can't be determined since it no longer has an entry, so it's
+    // reported unconditionally.
+    for key in unseen {
+        if let Some(prev) = before.get(&key) {
+            changes.push(DocChange {
+                key,
+                old: Some(prev.clone()),
+                new: None,
+            });
+        }
+    }
+
+    if !changes.is_empty() {
+        let diff = EventDocsDiff {
+            address: address.to_string(),
+            changes,
+        };
+        match event_bus.emitter::<EventDocsDiff>().await {
+            Ok(emitter) => {
+                if let Err(e) = emitter.emit(diff) {
+                    warn!("Failed to broadcast replicated document diff: {:?}", e);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to obtain EventDocsDiff emitter for replicated document diff: {:?}",
+                    e
+                );
             }
         }
     }
@@ -476,7 +580,16 @@ impl GuardianDBDocumentStore {
     ///
     /// Queries all document entries and rebuilds the in-memory index.
     pub async fn sync_index_from_docs(&self) -> Result<usize> {
-        refresh_doc_index(&self.docs, &self.doc_handle, &self.client, &self.index).await
+        refresh_doc_index(
+            &self.docs,
+            &self.doc_handle,
+            &self.client,
+            &self.index,
+            self.author_id,
+            &self.event_bus,
+            &self.cached_address.to_string(),
+        )
+        .await
     }
 
     /// Starts a background task that keeps the in-memory index synchronized with the
@@ -486,6 +599,9 @@ impl GuardianDBDocumentStore {
         let doc = self.doc_handle.clone();
         let client = self.client.clone();
         let index = self.index.clone();
+        let local_author = self.author_id;
+        let event_bus = self.event_bus.clone();
+        let address = self.cached_address.to_string();
 
         tokio::spawn(async move {
             let mut stream = match doc.subscribe().await {
@@ -511,7 +627,18 @@ impl GuardianDBDocumentStore {
                         | Ok(LiveEvent::PendingContentReady)
                         | Ok(LiveEvent::SyncFinished(_))
                 );
-                if is_remote && let Err(e) = refresh_doc_index(&docs, &doc, &client, &index).await {
+                if is_remote
+                    && let Err(e) = refresh_doc_index(
+                        &docs,
+                        &doc,
+                        &client,
+                        &index,
+                        local_author,
+                        &event_bus,
+                        &address,
+                    )
+                    .await
+                {
                     warn!("Failed to update Document index via live sync: {:?}", e);
                 }
             }

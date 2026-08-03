@@ -493,7 +493,9 @@ async fn storage_bucket_limits_enforced() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // Multipart bodies are a typed unsupported error, not silence.
+    // multipart/form-data is parsed for real (see tests/supabase_storage_tus.rs
+    // for the full suite); a body with no file part is a typed error, not
+    // silence. `--xyz--` alone is a validly-framed, zero-part multipart body.
     let (status, _h2, bytes) = call_raw(
         &h.app,
         "POST",
@@ -505,9 +507,9 @@ async fn storage_bucket_limits_enforced() {
         Some(b"--xyz--".to_vec()),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body["error"], "SUPA_COMPAT_STORAGE_MULTIPART_UNSUPPORTED");
+    assert_eq!(body["error"], "invalid_multipart");
 }
 
 #[tokio::test]
@@ -1586,11 +1588,11 @@ async fn realtime_broadcast_between_subscribers() {
 }
 
 // ===========================================================================
-// Gateway: functions keeps its typed 501; graphql is live
+// Gateway: functions relay-404s an unknown slug; graphql is live
 // ===========================================================================
 
 #[tokio::test]
-async fn functions_remains_typed_501_and_graphql_is_live() {
+async fn functions_relay_404_and_graphql_is_live() {
     let h = harness().await;
     let (status, body) = call(
         &h.app,
@@ -1601,8 +1603,9 @@ async fn functions_remains_typed_501_and_graphql_is_live() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(body["code"], "SUPA_COMPAT_FUNCTIONS_NOT_IMPLEMENTED");
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], 404);
+    assert_eq!(body["message"], "Requested function was not found");
 
     // GraphQL is implemented (see tests/supabase_graphql.rs): a real request
     // executes and returns GraphQL-shaped JSON with HTTP 200.

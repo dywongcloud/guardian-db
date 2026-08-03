@@ -6,10 +6,14 @@
 /// - Batch processing for optimized throughput
 /// - Real-time performance monitoring
 use crate::guardian::error::{GuardianError, Result};
-use crate::p2p::network::{config::ClientConfig, types::*};
+use crate::p2p::network::{
+    config::{ClientConfig, RelayConfig},
+    types::*,
+};
 use bytes::Bytes;
 use iroh::SecretKey;
-use iroh::endpoint::Endpoint;
+use iroh::address_lookup::memory::MemoryLookup;
+use iroh::endpoint::{Endpoint, RelayMode, presets};
 use iroh::protocol::Router;
 use iroh::{EndpointAddr as NodeAddr, EndpointId as NodeId};
 use iroh_blobs::api::Tag;
@@ -130,7 +134,6 @@ enum StoreType {
 /// - Continuous performance monitoring
 pub struct IrohBackend {
     /// Backend configuration.
-    #[allow(dead_code)]
     config: ClientConfig,
     /// Node data directory.
     data_dir: PathBuf,
@@ -508,6 +511,27 @@ impl IrohBackend {
         Ok(secret_key)
     }
 
+    /// Translates a [`RelayConfig`] into the [`RelayMode`] iroh expects,
+    /// parsing and validating any custom relay URLs.
+    fn build_relay_mode(relay: &RelayConfig) -> Result<RelayMode> {
+        match relay {
+            RelayConfig::Disabled => Ok(RelayMode::Disabled),
+            RelayConfig::N0Default => Ok(RelayMode::Default),
+            RelayConfig::N0Staging => Ok(RelayMode::Staging),
+            RelayConfig::Custom(urls) => {
+                let parsed = urls
+                    .iter()
+                    .map(|u| {
+                        u.parse::<iroh::RelayUrl>().map_err(|e| {
+                            GuardianError::Other(format!("Invalid custom relay URL '{u}': {e}"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(RelayMode::custom(parsed))
+            }
+        }
+    }
+
     /// Initializes the embedded Iroh node.
     async fn initialize_node(&self) -> Result<()> {
         debug!("Initializing Iroh node with FsStore for persistence...");
@@ -529,25 +553,73 @@ impl IrohBackend {
             *store_lock = Some(StoreType::Fs(fs_store));
         }
 
-        // Initialize the Endpoint for P2P communication with native address lookup services.
-        // Iroh 1.0 uses the N0 preset, which enables DNS + Pkarr discovery via n0.computer (global).
-        // Local mDNS discovery (LAN) is added after binding via iroh-mdns-address-lookup.
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        // Initialize the Endpoint for P2P communication, respecting the configured
+        // discovery settings rather than always depending on n0.computer's public
+        // infrastructure. This matters for private/local-first/air-gapped
+        // deployments (and for embedding apps that run their own transport) where
+        // outbound access to n0.computer is unavailable or undesired.
+        //
+        // - enable_discovery_n0=true:  N0 preset (DNS + Pkarr discovery, default relay).
+        // - enable_discovery_n0=false: Minimal preset (crypto provider only, no
+        //   address lookup, relay disabled) - purely local/direct connectivity.
+        let mut builder = if self.config.enable_discovery_n0 {
+            Endpoint::builder(presets::N0)
+        } else {
+            Endpoint::builder(presets::Minimal)
+        };
+
+        // An explicit relay override replaces whatever relay setting the preset
+        // above chose (n0's default relay, or none). This lets a deployment run
+        // self-hosted relay infrastructure - or force relay on/off - completely
+        // independently of the discovery setting above.
+        if let Some(relay_config) = &self.config.relay {
+            builder = builder.relay_mode(Self::build_relay_mode(relay_config)?);
+        }
+
+        let endpoint = builder
             .secret_key(self.secret_key.clone())
             .bind()
             .await
             .map_err(|e| GuardianError::Other(format!("Error initializing Endpoint: {}", e)))?;
 
-        // mDNS discovery on the local network (LAN), equivalent to the former discovery_local_network().
-        match MdnsAddressLookup::builder().build(endpoint.id()) {
-            Ok(mdns) => match endpoint.address_lookup() {
+        // Local mDNS discovery (LAN), equivalent to the former discovery_local_network().
+        // Only enabled when configured - some deployments (offline/tests/private
+        // networks) explicitly disable it to avoid multicast traffic or reliance
+        // on LAN discovery working in the runtime environment (e.g. containers).
+        if self.config.enable_discovery_mdns {
+            match MdnsAddressLookup::builder().build(endpoint.id()) {
+                Ok(mdns) => match endpoint.address_lookup() {
+                    Ok(services) => {
+                        services.add(mdns);
+                        debug!("Local mDNS discovery (LAN) enabled");
+                    }
+                    Err(e) => warn!("Address lookup unavailable for mDNS: {}", e),
+                },
+                Err(e) => warn!("Could not start local mDNS discovery: {}", e),
+            }
+        } else {
+            debug!("Local mDNS discovery (LAN) disabled by configuration");
+        }
+
+        // Register any statically configured bootstrap peer addresses so nodes can
+        // rendezvous purely from config, without depending on any discovery
+        // service or a manual add_node_addr() call after construction. This uses
+        // the same MemoryLookup mechanism as IrohClient::add_node_addr.
+        if !self.config.known_peers.is_empty() {
+            match endpoint.address_lookup() {
                 Ok(services) => {
-                    services.add(mdns);
-                    debug!("Local mDNS discovery (LAN) enabled");
+                    let lookup = MemoryLookup::new();
+                    for peer in &self.config.known_peers {
+                        lookup.add_endpoint_info(peer.clone());
+                    }
+                    services.add(lookup);
+                    debug!(
+                        "Registered {} statically configured bootstrap peer(s)",
+                        self.config.known_peers.len()
+                    );
                 }
-                Err(e) => warn!("Address lookup unavailable for mDNS: {}", e),
-            },
-            Err(e) => warn!("Could not start local mDNS discovery: {}", e),
+                Err(e) => warn!("Address lookup unavailable for known_peers: {}", e),
+            }
         }
 
         // Store the endpoint.
@@ -2494,5 +2566,61 @@ Performance Score: {:.1}/10
             perf_history_count,
             (hit_ratio * 10.0).clamp(1.0, 10.0)
         )
+    }
+}
+
+#[cfg(test)]
+mod relay_config_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_maps_to_relay_mode_disabled() {
+        let mode = IrohBackend::build_relay_mode(&RelayConfig::Disabled).unwrap();
+        assert_eq!(mode, RelayMode::Disabled);
+        assert!(mode.relay_map().is_empty());
+    }
+
+    #[test]
+    fn n0_default_maps_to_relay_mode_default() {
+        let mode = IrohBackend::build_relay_mode(&RelayConfig::N0Default).unwrap();
+        assert_eq!(mode, RelayMode::Default);
+    }
+
+    #[test]
+    fn n0_staging_maps_to_relay_mode_staging() {
+        let mode = IrohBackend::build_relay_mode(&RelayConfig::N0Staging).unwrap();
+        assert_eq!(mode, RelayMode::Staging);
+    }
+
+    #[test]
+    fn custom_produces_a_relay_map_with_exactly_the_given_urls() {
+        let relay = RelayConfig::Custom(vec![
+            "https://relay1.example.com".to_string(),
+            "https://relay2.example.com".to_string(),
+        ]);
+        let mode = IrohBackend::build_relay_mode(&relay).unwrap();
+        let map = mode.relay_map();
+        assert_eq!(map.len(), 2);
+
+        let expected1: iroh::RelayUrl = "https://relay1.example.com".parse().unwrap();
+        let expected2: iroh::RelayUrl = "https://relay2.example.com".parse().unwrap();
+        assert!(map.get(&expected1).is_some());
+        assert!(map.get(&expected2).is_some());
+    }
+
+    #[test]
+    fn custom_rejects_an_unparseable_url() {
+        let relay = RelayConfig::Custom(vec!["not a valid url".to_string()]);
+        assert!(IrohBackend::build_relay_mode(&relay).is_err());
+    }
+
+    #[test]
+    fn custom_with_empty_list_produces_an_empty_relay_map() {
+        // build_relay_mode itself doesn't reject an empty list (ClientConfig::validate
+        // does, at the config layer) - but confirm it degrades harmlessly rather than
+        // panicking if ever called directly with one.
+        let relay = RelayConfig::Custom(vec![]);
+        let mode = IrohBackend::build_relay_mode(&relay).unwrap();
+        assert!(mode.relay_map().is_empty());
     }
 }

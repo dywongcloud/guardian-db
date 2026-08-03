@@ -124,10 +124,13 @@ async fn missing_apikey_is_401_typed() {
 }
 
 #[tokio::test]
-async fn functions_service_is_501_not_404() {
+async fn unknown_functions_slug_is_relay_404_not_bare_404() {
     // Storage / realtime / pg-meta are implemented since stage 3 (see
-    // tests/supabase_storage_realtime.rs) and graphql since stage 4 (see
-    // tests/supabase_graphql.rs); functions keeps its precise typed 501.
+    // tests/supabase_storage_realtime.rs), graphql since stage 4 (see
+    // tests/supabase_graphql.rs), and functions since stage 5 (see
+    // tests/supabase_functions.rs): an unregistered slug renders the
+    // functions-relay `{"code","message"}` shape (never a bare 404, and
+    // distinct from SupaError's `SUPA_COMPAT_*`-coded shape).
     let h = harness().await;
     let (status, _h, body) = call(
         &h.app,
@@ -139,9 +142,9 @@ async fn functions_service_is_501_not_404() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(body["code"], "SUPA_COMPAT_FUNCTIONS_NOT_IMPLEMENTED");
-    assert_eq!(body["hint"], "tracked for a later slice");
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], 404);
+    assert_eq!(body["message"], "Requested function was not found");
 
     // A missing storage object is now a typed storage-api error, not a 501.
     let (status, _h, body) = call(

@@ -26,7 +26,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, head, post};
 use axum::{Extension, Json as AxumJson};
 use chrono::Utc;
 use serde_json::{Map, Value as Json, json};
@@ -36,6 +36,7 @@ use crate::supabase::error::{SupaError, status_for_sqlstate};
 use crate::supabase::gateway::{AppState, AuthContext, header_str, run_batch, run_sql, run_sql_as};
 use crate::supabase::jwt::{self, Claims};
 use crate::supabase::rest::{parse_query_pairs, value_to_json};
+use crate::supabase::tus;
 
 /// Maximum accepted upload size (bytes). Objects pass through the SQL layer,
 /// so this is deliberately conservative; buckets can lower it further with
@@ -122,6 +123,22 @@ pub fn protected_router<S: RelationalStorage + 'static>() -> Router<AppState<S>>
             "/object/sign/{bucket}/{*path}",
             post(create_signed_url::<S>),
         )
+        // TUS 1.0.0 resumable uploads (creation, creation-with-upload,
+        // expiration, termination — see `crate::supabase::tus`). Real
+        // tus-js-client sends `authorization`/`apikey` on every request per
+        // Supabase's own docs, so these sit behind the apikey layer like
+        // every other authenticated storage route.
+        .route(
+            "/upload/resumable",
+            post(tus::create::<S>).options(tus::capabilities),
+        )
+        .route(
+            "/upload/resumable/{id}",
+            head(tus::head::<S>)
+                .patch(tus::patch::<S>)
+                .delete(tus::terminate::<S>)
+                .options(tus::capabilities),
+        )
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
 }
 
@@ -163,7 +180,7 @@ pub fn storage_error(status: StatusCode, error: &str, message: &str) -> Response
 
 /// Convert a gateway error into the storage-api error shape. SQL errors keep
 /// their SQLSTATE as the `error` field (RLS denials surface as `42501` → 403).
-fn storage_error_from(e: SupaError) -> Response {
+pub(crate) fn storage_error_from(e: SupaError) -> Response {
     if let SupaError::Sql(err) = &e {
         let state = err.sqlstate();
         return storage_error(status_for_sqlstate(state), state, &err.to_string());
@@ -180,7 +197,7 @@ where
     fut.await.unwrap_or_else(storage_error_from)
 }
 
-fn not_found(what: &str) -> Response {
+pub(crate) fn not_found(what: &str) -> Response {
     storage_error(StatusCode::NOT_FOUND, "not_found", what)
 }
 
@@ -428,6 +445,127 @@ async fn empty_bucket<S: RelationalStorage + 'static>(
 // Objects: upload / download
 // ---------------------------------------------------------------------------
 
+/// The outcome of [`store_object`]: either the object was written (returning
+/// its id), or it was refused with an already-rendered typed response
+/// (missing bucket, size/mime limits, or a non-upsert duplicate).
+pub(crate) enum StoreOutcome {
+    Stored(uuid::Uuid),
+    Refused(Response),
+}
+
+/// The shared object-write path: bucket lookup, size/mime checks, the
+/// role-bound `INSERT INTO storage.objects` (honoring `upsert`), and the
+/// internal `INSERT INTO storage._blobs`. Used by the raw-body and
+/// `multipart/form-data` upload paths in [`upload`] and by the TUS `PATCH`
+/// finalize path in [`crate::supabase::tus`] — every way bytes can become an
+/// object goes through exactly this sequence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn store_object<S: RelationalStorage + 'static>(
+    state: &AppState<S>,
+    auth: &AuthContext,
+    bucket: &str,
+    name: &str,
+    content_type: &str,
+    cache_control: &str,
+    upsert: bool,
+    bytes: &[u8],
+) -> Result<StoreOutcome, SupaError> {
+    // Bucket existence + limits are checked internally (service_role), like
+    // the storage service does; the object write itself is role-bound.
+    let Some(bucket_row) = fetch_bucket(state, bucket).await? else {
+        return Ok(StoreOutcome::Refused(not_found("Bucket not found")));
+    };
+    if let Some(limit) = bucket_row.get("file_size_limit").and_then(Json::as_i64)
+        && (bytes.len() as i64) > limit
+    {
+        return Ok(StoreOutcome::Refused(storage_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Payload too large",
+            "The object exceeded the maximum allowed size",
+        )));
+    }
+    if let Some(allowed) = bucket_row
+        .get("allowed_mime_types")
+        .and_then(Json::as_array)
+        && !mime_allowed(content_type, allowed)
+    {
+        return Ok(StoreOutcome::Refused(storage_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_mime_type",
+            &format!("mime type {content_type} is not supported"),
+        )));
+    }
+
+    let id = uuid::Uuid::new_v4();
+    let now = Utc::now();
+    let metadata = json!({
+        "mimetype": content_type,
+        "size": bytes.len(),
+        "cacheControl": cache_control,
+        "lastModified": now.to_rfc3339(),
+        "contentLength": bytes.len(),
+    });
+
+    let conflict = if upsert {
+        " ON CONFLICT (bucket_id, name) DO UPDATE SET owner = EXCLUDED.owner, \
+         metadata = EXCLUDED.metadata, updated_at = EXCLUDED.updated_at"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "INSERT INTO storage.objects \
+         (id, bucket_id, name, owner, metadata, created_at, updated_at, last_accessed_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8){conflict} RETURNING id"
+    );
+    let result = run_sql_as(
+        &state.db,
+        auth,
+        &sql,
+        vec![
+            SqlValue::Uuid(id),
+            SqlValue::Text(bucket.to_string()),
+            SqlValue::Text(name.to_string()),
+            owner_value(auth),
+            SqlValue::Json(metadata),
+            SqlValue::Timestamptz(now),
+            SqlValue::Timestamptz(now),
+            SqlValue::Timestamptz(now),
+        ],
+    )
+    .await;
+    let rows = match result {
+        Ok(r) => result_objects(r)?,
+        Err(e) if e.sqlstate() == "23505" => {
+            return Ok(StoreOutcome::Refused(storage_error(
+                StatusCode::CONFLICT,
+                "Duplicate",
+                "The resource already exists",
+            )));
+        }
+        Err(e) => return Err(SupaError::Sql(e)),
+    };
+    let object_id = rows
+        .first()
+        .and_then(|o| o.get("id"))
+        .and_then(Json::as_str)
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .ok_or_else(|| SupaError::Internal("object insert returned no id".into()))?;
+
+    // Bytes are written after the role-bound insert proved the caller may
+    // create the object; the blob table itself is internal (service_role).
+    run_sql(
+        &state.db,
+        "service_role",
+        "INSERT INTO storage._blobs (object_id, content) VALUES ($1, $2) \
+         ON CONFLICT (object_id) DO UPDATE SET content = EXCLUDED.content",
+        vec![SqlValue::Uuid(object_id), SqlValue::Bytea(bytes.to_vec())],
+    )
+    .await
+    .map_err(SupaError::Sql)?;
+
+    Ok(StoreOutcome::Stored(object_id))
+}
+
 async fn upload<S: RelationalStorage + 'static>(
     State(state): State<AppState<S>>,
     Extension(auth): Extension<AuthContext>,
@@ -438,125 +576,246 @@ async fn upload<S: RelationalStorage + 'static>(
     run(async {
         ensure_schema(&state).await?;
         let name = normalize_object_name(&path)?;
-        let content_type = header_str(&headers, "content-type")
+        let header_content_type = header_str(&headers, "content-type")
             .unwrap_or("application/octet-stream")
             .to_string();
-        if content_type.starts_with("multipart/form-data") {
-            return Ok(storage_error(
-                StatusCode::NOT_IMPLEMENTED,
-                "SUPA_COMPAT_STORAGE_MULTIPART_UNSUPPORTED",
-                "multipart/form-data uploads are not implemented in this slice; \
-                 send the file as the raw request body with its content-type header \
-                 (what supabase-js does in browsers)",
-            ));
-        }
+        let header_cache_control = header_str(&headers, "cache-control")
+            .unwrap_or("no-cache")
+            .to_string();
 
-        // Bucket existence + limits are checked internally (service_role), like
-        // the storage service does; the object write itself is role-bound.
-        let Some(bucket_row) = fetch_bucket(&state, &bucket).await? else {
-            return Ok(not_found("Bucket not found"));
-        };
-        if let Some(limit) = bucket_row.get("file_size_limit").and_then(Json::as_i64)
-            && (body.len() as i64) > limit
-        {
-            return Ok(storage_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "Payload too large",
-                "The object exceeded the maximum allowed size",
-            ));
-        }
-        if let Some(allowed) = bucket_row
-            .get("allowed_mime_types")
-            .and_then(Json::as_array)
-            && !mime_allowed(&content_type, allowed)
-        {
-            return Ok(storage_error(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "invalid_mime_type",
-                &format!("mime type {content_type} is not supported"),
-            ));
-        }
+        let (file_bytes, content_type, cache_control): (Vec<u8>, String, String) =
+            if header_content_type.starts_with("multipart/form-data") {
+                let Some(boundary) = multipart_boundary(&header_content_type) else {
+                    return Ok(storage_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_multipart",
+                        "missing boundary parameter in Content-Type",
+                    ));
+                };
+                let parts = match parse_multipart(&body, &boundary) {
+                    Ok(p) => p,
+                    Err(reason) => {
+                        return Ok(storage_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_multipart",
+                            &reason,
+                        ));
+                    }
+                };
+                let file_parts: Vec<&MultipartPart> =
+                    parts.iter().filter(|p| p.filename.is_some()).collect();
+                let file_part = match file_parts.as_slice() {
+                    [] => {
+                        return Ok(storage_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_multipart",
+                            "no file part",
+                        ));
+                    }
+                    [only] => *only,
+                    _ => {
+                        return Ok(storage_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_multipart",
+                            "more than one file part",
+                        ));
+                    }
+                };
+                let part_content_type = file_part
+                    .content_type
+                    .clone()
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                let part_cache_control = parts
+                    .iter()
+                    .find(|p| p.filename.is_none() && p.name.as_deref() == Some("cacheControl"))
+                    .and_then(|p| String::from_utf8(p.data.clone()).ok())
+                    .unwrap_or(header_cache_control);
+                (
+                    file_part.data.clone(),
+                    part_content_type,
+                    part_cache_control,
+                )
+            } else {
+                (body.to_vec(), header_content_type, header_cache_control)
+            };
 
         let upsert = header_str(&headers, "x-upsert")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let id = uuid::Uuid::new_v4();
-        let now = Utc::now();
-        let metadata = json!({
-            "mimetype": content_type,
-            "size": body.len(),
-            "cacheControl": header_str(&headers, "cache-control").unwrap_or("no-cache"),
-            "lastModified": now.to_rfc3339(),
-            "contentLength": body.len(),
-        });
-
-        let conflict = if upsert {
-            " ON CONFLICT (bucket_id, name) DO UPDATE SET owner = EXCLUDED.owner, \
-             metadata = EXCLUDED.metadata, updated_at = EXCLUDED.updated_at"
-        } else {
-            ""
-        };
-        let sql = format!(
-            "INSERT INTO storage.objects \
-             (id, bucket_id, name, owner, metadata, created_at, updated_at, last_accessed_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8){conflict} RETURNING id"
-        );
-        let result = run_sql_as(
-            &state.db,
+        match store_object(
+            &state,
             &auth,
-            &sql,
-            vec![
-                SqlValue::Uuid(id),
-                SqlValue::Text(bucket.clone()),
-                SqlValue::Text(name.clone()),
-                owner_value(&auth),
-                SqlValue::Json(metadata),
-                SqlValue::Timestamptz(now),
-                SqlValue::Timestamptz(now),
-                SqlValue::Timestamptz(now),
-            ],
+            &bucket,
+            &name,
+            &content_type,
+            &cache_control,
+            upsert,
+            &file_bytes,
         )
-        .await;
-        let rows = match result {
-            Ok(r) => result_objects(r)?,
-            Err(e) if e.sqlstate() == "23505" => {
-                return Ok(storage_error(
-                    StatusCode::CONFLICT,
-                    "Duplicate",
-                    "The resource already exists",
-                ));
-            }
-            Err(e) => return Err(SupaError::Sql(e)),
-        };
-        let object_id = rows
-            .first()
-            .and_then(|o| o.get("id"))
-            .and_then(Json::as_str)
-            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            .ok_or_else(|| SupaError::Internal("object insert returned no id".into()))?;
-
-        // Bytes are written after the role-bound insert proved the caller may
-        // create the object; the blob table itself is internal (service_role).
-        run_sql(
-            &state.db,
-            "service_role",
-            "INSERT INTO storage._blobs (object_id, content) VALUES ($1, $2) \
-             ON CONFLICT (object_id) DO UPDATE SET content = EXCLUDED.content",
-            vec![SqlValue::Uuid(object_id), SqlValue::Bytea(body.to_vec())],
-        )
-        .await
-        .map_err(SupaError::Sql)?;
-
-        Ok((
-            StatusCode::OK,
-            AxumJson(json!({
-                "Id": object_id.to_string(),
-                "Key": format!("{bucket}/{name}"),
-            })),
-        )
-            .into_response())
+        .await?
+        {
+            StoreOutcome::Stored(object_id) => Ok((
+                StatusCode::OK,
+                AxumJson(json!({
+                    "Id": object_id.to_string(),
+                    "Key": format!("{bucket}/{name}"),
+                })),
+            )
+                .into_response()),
+            StoreOutcome::Refused(resp) => Ok(resp),
+        }
     })
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Objects: `multipart/form-data` uploads
+// ---------------------------------------------------------------------------
+
+/// One part of a parsed `multipart/form-data` body.
+#[derive(Debug)]
+struct MultipartPart {
+    name: Option<String>,
+    filename: Option<String>,
+    content_type: Option<String>,
+    data: Vec<u8>,
+}
+
+/// Extract the `boundary` parameter from a `multipart/form-data` content-type
+/// header, handling both `boundary="..."` and bare `boundary=...` forms.
+fn multipart_boundary(content_type: &str) -> Option<String> {
+    content_type.split(';').skip(1).find_map(|raw| {
+        let param = raw.trim();
+        let eq = param.find('=')?;
+        let (key, value) = (&param[..eq], param[eq + 1..].trim());
+        if !key.trim().eq_ignore_ascii_case("boundary") {
+            return None;
+        }
+        let unquoted = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(value);
+        Some(unquoted.to_string())
+    })
+}
+
+/// Find the first occurrence of `needle` in `haystack`, if any.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Extract a `key="quoted value"` (backslash-escape aware) or `key=bare`
+/// parameter from a `Content-Disposition`-style header value.
+fn extract_disposition_param(value: &str, key: &str) -> Option<String> {
+    for segment in value.split(';').skip(1) {
+        let segment = segment.trim();
+        let eq = segment.find('=')?;
+        if !segment[..eq].trim().eq_ignore_ascii_case(key) {
+            continue;
+        }
+        let raw = segment[eq + 1..].trim();
+        let Some(quoted) = raw.strip_prefix('"') else {
+            return Some(raw.to_string());
+        };
+        let mut out = String::new();
+        let mut chars = quoted.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                }
+                '"' => return Some(out),
+                _ => out.push(c),
+            }
+        }
+        return Some(out); // unterminated quote: lenient, return what we have.
+    }
+    None
+}
+
+/// Parse a `multipart/form-data` body per RFC 2046 framing: parts delimited
+/// by `--{boundary}` + CRLF, per-part headers terminated by a blank line
+/// (CRLFCRLF), and a final `--{boundary}--` delimiter. Any framing violation
+/// (missing close delimiter, LF-only line endings where CRLF is required,
+/// malformed headers) is a typed `Err` with a human-readable reason.
+fn parse_multipart(body: &[u8], boundary: &str) -> Result<Vec<MultipartPart>, String> {
+    let delim = format!("--{boundary}");
+    let delim_bytes = delim.as_bytes();
+    if !body.starts_with(delim_bytes) {
+        return Err("multipart body does not start with the boundary delimiter".to_string());
+    }
+    let mut pos = delim_bytes.len();
+    let mut parts = Vec::new();
+    loop {
+        if body[pos..].starts_with(b"--") {
+            let rest = &body[pos + 2..];
+            let rest = rest.strip_prefix(b"\r\n").unwrap_or(rest);
+            if !rest.is_empty() {
+                return Err("unexpected data after the final boundary delimiter".to_string());
+            }
+            break;
+        }
+        if !body[pos..].starts_with(b"\r\n") {
+            return Err(
+                "boundary delimiter must be followed by CRLF (LF-only line endings are rejected)"
+                    .to_string(),
+            );
+        }
+        pos += 2;
+
+        let mut headers: Vec<(String, String)> = Vec::new();
+        loop {
+            let line_end = find_subslice(&body[pos..], b"\n")
+                .ok_or_else(|| "unterminated header line in a multipart part".to_string())?;
+            if line_end == 0 || body[pos + line_end - 1] != b'\r' {
+                return Err(
+                    "multipart header line must be CRLF-terminated (LF-only is rejected)"
+                        .to_string(),
+                );
+            }
+            let line = &body[pos..pos + line_end - 1];
+            pos += line_end + 1;
+            if line.is_empty() {
+                break;
+            }
+            let line_str = std::str::from_utf8(line)
+                .map_err(|_| "multipart header line is not valid UTF-8".to_string())?;
+            let (k, v) = line_str
+                .split_once(':')
+                .ok_or_else(|| format!("malformed multipart header line: {line_str:?}"))?;
+            headers.push((k.trim().to_string(), v.trim().to_string()));
+        }
+
+        let needle = format!("\r\n{delim}");
+        let rel = find_subslice(&body[pos..], needle.as_bytes())
+            .ok_or_else(|| "missing closing boundary delimiter for a multipart part".to_string())?;
+        let data = body[pos..pos + rel].to_vec();
+        pos += rel + needle.len();
+
+        let disposition = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-disposition"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        let name = extract_disposition_param(disposition, "name");
+        let filename = extract_disposition_param(disposition, "filename");
+        let content_type = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone());
+        parts.push(MultipartPart {
+            name,
+            filename,
+            content_type,
+            data,
+        });
+    }
+    Ok(parts)
 }
 
 async fn download_authed<S: RelationalStorage + 'static>(
@@ -985,7 +1244,7 @@ async fn list_objects<S: RelationalStorage + 'static>(
 // ---------------------------------------------------------------------------
 
 /// Fetch a bucket row (internal, service_role — existence checks and limits).
-async fn fetch_bucket<S: RelationalStorage + 'static>(
+pub(crate) async fn fetch_bucket<S: RelationalStorage + 'static>(
     state: &AppState<S>,
     id: &str,
 ) -> Result<Option<Json>, SupaError> {
@@ -1154,7 +1413,7 @@ fn json_object(body: &Bytes) -> Result<Map<String, Json>, SupaError> {
 /// Normalize an object key: strip leading slashes, reject empty / traversal
 /// segments. Keys are only ever bound as SQL parameters, so this is a shape
 /// check, not an injection defense.
-fn normalize_object_name(path: &str) -> Result<String, SupaError> {
+pub(crate) fn normalize_object_name(path: &str) -> Result<String, SupaError> {
     let name = path.trim_start_matches('/');
     if name.is_empty() {
         return Err(SupaError::BadRequest("object key must not be empty".into()));
@@ -1172,7 +1431,7 @@ fn normalize_object_name(path: &str) -> Result<String, SupaError> {
 
 /// Does `content_type` match the bucket's allowed list (exact, `type/*`, or
 /// `*/*`)?
-fn mime_allowed(content_type: &str, allowed: &[Json]) -> bool {
+pub(crate) fn mime_allowed(content_type: &str, allowed: &[Json]) -> bool {
     let ct = content_type
         .split(';')
         .next()
@@ -1261,5 +1520,86 @@ mod tests {
     fn signed_path_encoding() {
         assert_eq!(percent_encode_path("a/b c.txt"), "a/b%20c.txt");
         assert_eq!(percent_encode_path("plain.txt"), "plain.txt");
+    }
+
+    #[test]
+    fn multipart_boundary_bare_and_quoted() {
+        assert_eq!(
+            multipart_boundary("multipart/form-data; boundary=xyz").as_deref(),
+            Some("xyz")
+        );
+        assert_eq!(
+            multipart_boundary("multipart/form-data; boundary=\"xy z\"").as_deref(),
+            Some("xy z")
+        );
+        assert_eq!(
+            multipart_boundary("multipart/form-data; charset=utf-8; boundary=abc").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(multipart_boundary("multipart/form-data"), None);
+    }
+
+    #[test]
+    fn parse_multipart_happy_path() {
+        let body = b"--xyz\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"a.png\"\r\n\
+             Content-Type: image/png\r\n\
+             \r\n\
+             PNGDATA\r\n\
+             --xyz\r\n\
+             Content-Disposition: form-data; name=\"cacheControl\"\r\n\
+             \r\n\
+             max-age=60\r\n\
+             --xyz--\r\n";
+        let parts = parse_multipart(body, "xyz").unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].filename.as_deref(), Some("a.png"));
+        assert_eq!(parts[0].content_type.as_deref(), Some("image/png"));
+        assert_eq!(parts[0].data, b"PNGDATA");
+        assert_eq!(parts[1].name.as_deref(), Some("cacheControl"));
+        assert_eq!(parts[1].filename, None);
+        assert_eq!(parts[1].data, b"max-age=60");
+    }
+
+    #[test]
+    fn parse_multipart_quoted_boundary_via_full_header() {
+        let content_type = "multipart/form-data; boundary=\"b1\"";
+        let boundary = multipart_boundary(content_type).unwrap();
+        let body = b"--b1\r\n\
+             Content-Disposition: form-data; name=\"f\"; filename=\"x.txt\"\r\n\
+             \r\n\
+             hi\r\n\
+             --b1--\r\n";
+        let parts = parse_multipart(body, &boundary).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].data, b"hi");
+    }
+
+    #[test]
+    fn parse_multipart_missing_close_delimiter_is_err() {
+        let body = b"--xyz\r\n\
+             Content-Disposition: form-data; name=\"f\"; filename=\"x.txt\"\r\n\
+             \r\n\
+             hi\r\n";
+        assert!(parse_multipart(body, "xyz").is_err());
+    }
+
+    #[test]
+    fn parse_multipart_lf_only_is_rejected() {
+        // LF-only line endings after the boundary delimiter (no CR) must be
+        // a framing error, not silently tolerated.
+        let body = b"--xyz\nContent-Disposition: form-data; name=\"f\"; filename=\"x.txt\"\n\nhi\n--xyz--\n";
+        assert!(parse_multipart(body, "xyz").is_err());
+    }
+
+    #[test]
+    fn parse_multipart_quoted_filename_with_space() {
+        let body = b"--xyz\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"my file.txt\"\r\n\
+             \r\n\
+             hi\r\n\
+             --xyz--\r\n";
+        let parts = parse_multipart(body, "xyz").unwrap();
+        assert_eq!(parts[0].filename.as_deref(), Some("my file.txt"));
     }
 }

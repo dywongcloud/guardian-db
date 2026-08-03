@@ -25,8 +25,12 @@ pgwire = ["sql", "dep:pgwire"]
 # engine (the `supabase` module + `guardian-supabase` binary). Reuses the
 # hmac/sha2/base64/bcrypt crypto already pulled in by `sql`.
 # `graphql-parser` (pure Rust, tiny dep tree) parses GraphQL documents for the
-# pg_graphql-compatible `/graphql/v1` endpoint.
-supabase = ["sql", "dep:axum", "dep:tower", "dep:graphql-parser"]
+# pg_graphql-compatible `/graphql/v1` endpoint. `reqwest`/`rustls` back the
+# Edge Functions upstream-proxy mode and the HTTP transactional-mail transport;
+# both crates (and the `rustls-no-provider` / `aws_lc_rs` feature sets chosen
+# below) are already present in Cargo.lock via iroh's own reqwest/rustls use,
+# so enabling them here adds zero new lock entries.
+supabase = ["sql", "dep:axum", "dep:tower", "dep:graphql-parser", "dep:reqwest", "dep:rustls"]
 
 [dependencies]
 async-trait = "0.1.89"
@@ -87,6 +91,21 @@ tower = { version = "0.5", optional = true, features = ["util"] }
 # Spec-compliant GraphQL document parser for the pg_graphql-compatible endpoint
 # (fragments, variables, directives — what GraphiQL's introspection query uses).
 graphql-parser = { version = "0.4", optional = true }
+# Edge Functions upstream-proxy mode + the HTTP transactional-mail transport.
+# `rustls-no-provider` is the exact feature iroh's own reqwest already
+# resolves to (verified via `cargo tree -i reqwest -e features`), so this adds
+# no new [[package]] entries to Cargo.lock.
+reqwest = { version = "0.13", optional = true, default-features = false, features = [
+    "rustls-no-provider",
+] }
+# Installs the process-wide rustls crypto provider `reqwest` needs for HTTPS
+# when the gateway runs without iroh's networking stack (e.g. MemoryStorage
+# tests). `aws_lc_rs` is the provider iroh's own rustls build already resolves
+# to (its `rustls` dependency lists `aws-lc-rs`, not `ring`), so this only adds
+# a feature flag to an already-locked package, never a new provider path.
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+    "aws_lc_rs",
+] }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -193,6 +212,26 @@ required-features = ["supabase"]
 [[test]]
 name = "supabase_graphql"
 path = "tests/supabase_graphql.rs"
+required-features = ["supabase"]
+
+[[test]]
+name = "supabase_functions"
+path = "tests/supabase_functions.rs"
+required-features = ["supabase"]
+
+[[test]]
+name = "supabase_storage_tus"
+path = "tests/supabase_storage_tus.rs"
+required-features = ["supabase"]
+
+[[test]]
+name = "supabase_auth_email"
+path = "tests/supabase_auth_email.rs"
+required-features = ["supabase"]
+
+[[test]]
+name = "supabase_realtime_replication"
+path = "tests/supabase_realtime_replication.rs"
 required-features = ["supabase"]
 
 [[bench]]

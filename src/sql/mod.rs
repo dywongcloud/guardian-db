@@ -44,7 +44,7 @@ pub mod parser;
 /// a GuardianDB [`DocumentStore`](crate::traits::DocumentStore).
 mod guardian_storage;
 
-pub use engine::{ChangeEvent, ChangeOp, Database, Prepared, Session};
+pub use engine::{ChangeEvent, ChangeOp, ChangeSource, Database, Prepared, Session};
 pub use error::{Result as SqlResult, SqlError};
 pub use guardian_storage::{Consistency, GuardianRelationalStorage, open_sql, open_sql_with};
 pub use parser::parse_sql;

@@ -14,10 +14,16 @@
 //!
 //! ## Change source
 //!
-//! Postgres-changes events come from the engine's local commit hook
+//! Postgres-changes events come from the engine's row-change hook
 //! ([`Database::subscribe_changes`]): every websocket connection registers a
 //! listener and filters the stream against its bindings
-//! (schema / table / event / `col=eq.value` filter).
+//! (schema / table / event / `col=eq.value` filter). Events reach that hook
+//! from two origins, both delivered through the same channel: local commits
+//! (immediate, `ChangeSource::Local`) and, for GuardianDB-backed SQL
+//! databases, peer-authored writes that arrived via P2P replication
+//! (`ChangeSource::Replicated`, observed at refresh-interval granularity —
+//! see `GuardianRelationalStorage::refresh`). `deliver_change` and friends
+//! operate on `&ChangeEvent` generically and don't distinguish the two.
 //!
 //! ## Authorization — no unauthorized delivery
 //!
@@ -836,6 +842,7 @@ fn decode_doc(table: &Table, doc: &Json) -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::engine::ChangeSource;
 
     fn event(op: ChangeOp, new: Option<Json>, old: Option<Json>) -> ChangeEvent {
         ChangeEvent {
@@ -845,6 +852,7 @@ mod tests {
             old,
             new,
             commit_time: Utc::now(),
+            source: ChangeSource::Local,
         }
     }
 
