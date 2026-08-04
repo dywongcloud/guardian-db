@@ -237,9 +237,11 @@ async fn admin_bad_slug_is_rejected() {
 }
 
 #[tokio::test]
-async fn admin_bad_wasm_body_is_rejected() {
+async fn admin_bad_body_is_rejected() {
+    // Neither the `\0asm` magic nor valid UTF-8 (Deno source must be valid
+    // UTF-8 text) — the one shape that is rejected regardless of runtime.
     let h = harness().await;
-    let b64_junk = base64::engine::general_purpose::STANDARD.encode(b"not wasm");
+    let b64_junk = base64::engine::general_purpose::STANDARD.encode([0xFF, 0xFE, 0x00, 0xFF]);
     let (status, _, body) = call(
         &h.app,
         "POST",
@@ -247,6 +249,23 @@ async fn admin_bad_wasm_body_is_rejected() {
         Some(&h.service),
         None,
         Some(json!({ "slug": "bad", "body": b64_junk })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "SUPA_COMPAT_FUNCTION_BAD_REQUEST");
+}
+
+#[tokio::test]
+async fn admin_empty_deno_body_is_rejected() {
+    let h = harness().await;
+    let b64_empty = base64::engine::general_purpose::STANDARD.encode(b"   \n  ");
+    let (status, _, body) = call(
+        &h.app,
+        "POST",
+        "/functions/v1/_admin/functions",
+        Some(&h.service),
+        None,
+        Some(json!({ "slug": "empty", "body": b64_empty })),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -282,8 +301,9 @@ async fn admin_deploy_body_via_put() {
     let parsed: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(parsed["status"], "ACTIVE");
     assert_eq!(parsed["version"], 2);
+    assert_eq!(parsed["runtime"], "wasm");
 
-    let (status, _, got) = call_raw(
+    let (status, headers, got) = call_raw(
         &h.app,
         "GET",
         "/functions/v1/_admin/functions/hello/body",
@@ -293,6 +313,83 @@ async fn admin_deploy_body_via_put() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(got, wasm);
+    assert_eq!(headers.get("content-type").unwrap(), "application/wasm");
+}
+
+#[tokio::test]
+async fn admin_deploy_deno_function_via_create() {
+    let h = harness().await;
+    let source = b"Deno.serve((req) => new Response(\"hi\"));";
+    let b64 = base64::engine::general_purpose::STANDARD.encode(source);
+    let (status, _, body) = call(
+        &h.app,
+        "POST",
+        "/functions/v1/_admin/functions",
+        Some(&h.service),
+        None,
+        Some(json!({ "slug": "greeter", "body": b64 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["runtime"], "deno");
+    assert_eq!(body["status"], "ACTIVE");
+
+    let (status, headers, got) = call_raw(
+        &h.app,
+        "GET",
+        "/functions/v1/_admin/functions/greeter/body",
+        &[("apikey", h.service.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got, source);
+    assert_eq!(
+        headers.get("content-type").unwrap(),
+        "application/typescript"
+    );
+}
+
+#[tokio::test]
+async fn admin_deploy_deno_function_via_put_content_type() {
+    let h = harness().await;
+    call(
+        &h.app,
+        "POST",
+        "/functions/v1/_admin/functions",
+        Some(&h.service),
+        None,
+        Some(json!({ "slug": "ts-fn" })),
+    )
+    .await;
+
+    let source = b"export default (req: Request) => new Response(\"hi\");".to_vec();
+    let (status, _, body) = call_raw(
+        &h.app,
+        "PUT",
+        "/functions/v1/_admin/functions/ts-fn/body",
+        &[
+            ("apikey", h.service.as_str()),
+            ("content-type", "text/typescript"),
+        ],
+        Some(source.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["runtime"], "deno");
+    assert_eq!(parsed["status"], "ACTIVE");
+
+    let (status, _, got) = call_raw(
+        &h.app,
+        "GET",
+        "/functions/v1/_admin/functions/ts-fn/body",
+        &[("apikey", h.service.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got, source);
 }
 
 #[tokio::test]
@@ -718,4 +815,227 @@ async fn invoke_missing_handler_export_is_boot_error() {
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(body["error"], "SUPA_COMPAT_FUNCTION_BOOT_ERROR");
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end Deno execution (needs no `compute` feature — that's the point)
+//
+// These shell out to a real `deno` binary, so they need one on `PATH`. CI
+// installs Deno for exactly this (see .github/workflows/rust.yml); locally,
+// without it, they skip with a message rather than failing the suite —
+// mirroring how the WASM tests above are compiled out without `compute`
+// rather than failing.
+// ---------------------------------------------------------------------------
+
+fn deno_available() -> bool {
+    std::process::Command::new("deno")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+macro_rules! require_deno {
+    () => {
+        if !deno_available() {
+            eprintln!("skipping: no `deno` binary on PATH");
+            return;
+        }
+    };
+}
+
+#[tokio::test]
+async fn invoke_end_to_end_deno_returns_response() {
+    require_deno!();
+    let h = harness().await;
+    let source = br#"
+        Deno.serve(async (req) => {
+            const body = await req.text();
+            return new Response(JSON.stringify({
+                greeting: "hi from deno",
+                method: req.method,
+                echo: body,
+                secret: Deno.env.get("GREETING_SECRET"),
+            }), { status: 200, headers: { "content-type": "application/json" } });
+        });
+    "#;
+    call(
+        &h.app,
+        "POST",
+        "/functions/v1/_admin/functions",
+        Some(&h.service),
+        None,
+        Some(json!({
+            "slug": "deno-echo",
+            "verify_jwt": false,
+            "body": base64::engine::general_purpose::STANDARD.encode(source)
+        })),
+    )
+    .await;
+    call(
+        &h.app,
+        "POST",
+        "/functions/v1/_admin/functions/deno-echo/secrets",
+        Some(&h.service),
+        None,
+        Some(json!({ "name": "GREETING_SECRET", "value": "sesame" })),
+    )
+    .await;
+
+    let (status, _, body_bytes) = call_raw(
+        &h.app,
+        "POST",
+        "/functions/v1/deno-echo",
+        &[("apikey", h.anon.as_str()), ("content-type", "text/plain")],
+        Some(b"hello from the caller".to_vec()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(parsed["greeting"], "hi from deno");
+    assert_eq!(parsed["method"], "POST");
+    assert_eq!(parsed["echo"], "hello from the caller");
+    assert_eq!(parsed["secret"], "sesame");
+}
+
+#[tokio::test]
+async fn invoke_deno_handler_throw_is_runtime_error() {
+    require_deno!();
+    let h = harness().await;
+    let source = b"Deno.serve((_req) => { throw new Error(\"boom\"); });";
+    call(
+        &h.app,
+        "POST",
+        "/functions/v1/_admin/functions",
+        Some(&h.service),
+        None,
+        Some(json!({
+            "slug": "deno-throws",
+            "verify_jwt": false,
+            "body": base64::engine::general_purpose::STANDARD.encode(source)
+        })),
+    )
+    .await;
+
+    let (status, _, body) = call(
+        &h.app,
+        "POST",
+        "/functions/v1/deno-throws",
+        Some(&h.anon),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"], "SUPA_COMPAT_FUNCTION_RUNTIME_ERROR");
+}
+
+#[tokio::test]
+async fn invoke_deno_missing_handler_is_boot_error() {
+    require_deno!();
+    let h = harness().await;
+    let source = b"export const notAHandler = 1;";
+    call(
+        &h.app,
+        "POST",
+        "/functions/v1/_admin/functions",
+        Some(&h.service),
+        None,
+        Some(json!({
+            "slug": "deno-no-handler",
+            "verify_jwt": false,
+            "body": base64::engine::general_purpose::STANDARD.encode(source)
+        })),
+    )
+    .await;
+
+    let (status, _, body) = call(
+        &h.app,
+        "POST",
+        "/functions/v1/deno-no-handler",
+        Some(&h.anon),
+        None,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"], "SUPA_COMPAT_FUNCTION_BOOT_ERROR");
+}
+
+#[tokio::test]
+async fn invoke_deno_default_export_handler_works() {
+    require_deno!();
+    let h = harness().await;
+    let source = b"export default (req) => new Response(\"default export works\");";
+    call(
+        &h.app,
+        "POST",
+        "/functions/v1/_admin/functions",
+        Some(&h.service),
+        None,
+        Some(json!({
+            "slug": "deno-default-export",
+            "verify_jwt": false,
+            "body": base64::engine::general_purpose::STANDARD.encode(source)
+        })),
+    )
+    .await;
+
+    let (status, _, body_bytes) = call_raw(
+        &h.app,
+        "GET",
+        "/functions/v1/deno-default-export",
+        &[("apikey", h.anon.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body_bytes, b"default export works");
+}
+
+#[tokio::test]
+async fn invoke_deno_filesystem_denied_by_default() {
+    require_deno!();
+    // The default grant set is `--allow-net` (matching real Supabase Edge
+    // Functions, which can always `fetch`) plus a scratch-dir-scoped
+    // `--allow-read`/`--allow-write` for staging the function itself —
+    // never blanket filesystem access. A deployed function reaching outside
+    // that gets a real Deno `NotCapable` permission error, proving the
+    // sandbox isn't running with ambient authority.
+    let h = harness().await;
+    let source = br#"
+        Deno.serve(async (_req) => {
+            try {
+                await Deno.readTextFile("/etc/hostname");
+                return new Response("should not reach here");
+            } catch (e) {
+                return new Response(e.name, { status: 403 });
+            }
+        });
+    "#;
+    call(
+        &h.app,
+        "POST",
+        "/functions/v1/_admin/functions",
+        Some(&h.service),
+        None,
+        Some(json!({
+            "slug": "deno-sandboxed",
+            "verify_jwt": false,
+            "body": base64::engine::general_purpose::STANDARD.encode(source)
+        })),
+    )
+    .await;
+
+    let (status, _, body_bytes) = call_raw(
+        &h.app,
+        "GET",
+        "/functions/v1/deno-sandboxed",
+        &[("apikey", h.anon.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body_bytes, b"NotCapable");
 }

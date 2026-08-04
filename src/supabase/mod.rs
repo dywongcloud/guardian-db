@@ -87,6 +87,7 @@
 pub mod auth;
 pub mod error;
 pub mod functions;
+mod functions_deno;
 pub mod gateway;
 pub mod graphql;
 pub mod jwt;

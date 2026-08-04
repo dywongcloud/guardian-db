@@ -1,32 +1,48 @@
-//! Supabase Edge Functions-compatible service on top of Guardian Compute.
+//! Supabase Edge Functions-compatible service with two runtime substrates.
 //!
 //! Speaks the two halves of Supabase's Functions surface:
 //!
 //! * `/functions/v1/{slug}` — the **invocation** endpoint every Supabase client
 //!   library posts to. Verifies the caller (default `verify_jwt=true`, matching
-//!   the CLI), fetches the deployed WebAssembly body for `slug`, and runs it
-//!   inside the Guardian Compute WASM sandbox with the caller's request
-//!   folded into an opaque input envelope. The guest returns an output
-//!   envelope (status + headers + body) which is rendered as the HTTP
-//!   response. Supports `GET`, `POST`, `PUT`, `PATCH`, `DELETE` and the CORS
-//!   `OPTIONS` preflight (204).
+//!   the CLI), fetches the deployed body for `slug`, and runs it under the
+//!   [`FunctionRuntime`] detected at deploy time, with the caller's request
+//!   folded into an [`InvocationInput`] envelope. The guest returns an
+//!   [`InvocationOutput`] envelope (status + headers + body) which is
+//!   rendered as the HTTP response. Supports `GET`, `POST`, `PUT`, `PATCH`,
+//!   `DELETE` and the CORS `OPTIONS` preflight (204).
 //!
 //! * `/functions/v1/_admin/*` — the **management** endpoints Supabase's CLI
 //!   (`supabase functions deploy|list|delete`) and Studio talk to. All admin
 //!   routes require `service_role`; every mutation goes through parameterised
 //!   SQL against the `functions` schema (bootstrapped on first use).
 //!
-//! ## Runtime substrate
+//! ## Runtime substrates
 //!
-//! Function bodies are WebAssembly modules using the Guardian Compute ABI
-//! (`gdb_alloc` + a `handler` export with signature `(ptr, len) -> i64` where
-//! the return packs `(out_ptr << 32) | out_len`). Input is a CBOR-encoded
-//! [`InvocationInput`]; output is a CBOR-encoded [`InvocationOutput`]. Every
-//! run gets a fresh `Store` and a hard resource ceiling — the same isolation
-//! [`crate::compute::WasmRuntime`] enforces for delegated tasks. The only
-//! host capability linked in by default is `gdb.log`, so a function can
-//! `console.log`-equivalently emit into GuardianDB's tracing without any
-//! filesystem, network, or environment access.
+//! A deployed body is sniffed at deploy time (see [`FunctionRuntime`]) and
+//! stored with a `runtime` tag — no separate "which runtime" field for the
+//! caller to set:
+//!
+//! * **`wasm`** — a WebAssembly module (starts with the `\0asm` magic) using
+//!   the Guardian Compute ABI (`gdb_alloc` + a `handler` export with
+//!   signature `(ptr, len) -> i64` where the return packs `(out_ptr << 32) |
+//!   out_len`). Runs inside [`crate::compute::WasmRuntime`] — the same
+//!   sandbox delegated Guardian Compute tasks get, gated behind the
+//!   `compute` Cargo feature (it pulls in `wasmtime`). Every run gets a
+//!   fresh `Store` and a hard resource ceiling; the only host capability
+//!   linked in by default is `gdb.log`.
+//! * **`deno`** — plain Deno TypeScript/JavaScript source, the shape a real
+//!   Supabase Edge Function actually is
+//!   (`Deno.serve((req) => new Response(...))`). Runs by shelling out to a
+//!   `deno` binary — see the `functions_deno` module for the process
+//!   sandbox (least-privilege permission flags, env-cleared child process,
+//!   wall-clock + memory ceilings). **Needs no `compute`/wasmtime feature at
+//!   all** — this is what lets a project deploy an ordinary Deno function
+//!   without ever touching WebAssembly.
+//!
+//! Both substrates speak the same wire envelope, just different transports:
+//! the WASM guest gets a CBOR-encoded [`InvocationInput`]/[`InvocationOutput`]
+//! through linear memory; the Deno guest gets the same structs JSON-encoded
+//! over the child process's stdin/stdout.
 //!
 //! When a project sets `verify_jwt=false` (the CLI's `--no-verify-jwt`), the
 //! bearer/apikey is still required for admission but a missing `Authorization`
@@ -40,10 +56,13 @@
 //! The `functions` schema (see [`BOOTSTRAP_SQL`]) holds three tables:
 //!
 //! * `functions.functions` — one row per deployed function (slug, name,
-//!   verify_jwt, version, timestamps).
-//! * `functions._code` — the WASM body, keyed by function id (`bytea`).
+//!   verify_jwt, version, runtime, status, timestamps).
+//! * `functions._code` — the deployed body (wasm bytes or Deno source text,
+//!   as raw bytes either way), keyed by function id (`bytea`).
 //! * `functions.secrets` — per-function environment variables (name/value),
-//!   exposed to the guest through the input envelope's `env` map.
+//!   exposed to the guest through the input envelope's `env` map (the WASM
+//!   guest reads it from the envelope; the Deno guest also gets it as real
+//!   process env vars, scoped by `--allow-env`).
 //!
 //! All three tables have RLS enabled with **no default policies** — only
 //! `service_role` reaches them, exactly like `storage.buckets`.
@@ -86,6 +105,10 @@ pub const MAX_INVOKE_BODY_BYTES: usize = 6 * 1024 * 1024;
 /// Maximum accepted WebAssembly bundle size when deploying (bytes).
 pub const MAX_WASM_BUNDLE_BYTES: usize = 50 * 1024 * 1024;
 
+/// Maximum accepted Deno source size when deploying (bytes). Smaller than
+/// the wasm ceiling — this is a single source file, not a compiled bundle.
+pub const MAX_DENO_SOURCE_BYTES: usize = 10 * 1024 * 1024;
+
 /// The exported guest function every deployed WASM module must implement.
 pub const HANDLER_EXPORT: &str = "handler";
 
@@ -115,9 +138,16 @@ CREATE TABLE IF NOT EXISTS functions.functions (
     verify_jwt boolean NOT NULL,
     version bigint NOT NULL,
     status text NOT NULL,
+    runtime text,
     created_at timestamptz NOT NULL,
     updated_at timestamptz NOT NULL
 );
+
+-- Migration for schemas bootstrapped before the `runtime` column existed
+-- (deployments predating Deno-runtime support). Nullable and backfilled
+-- lazily: a NULL/missing `runtime` reads as `wasm` (the only substrate that
+-- existed before), and every write from here on sets it explicitly.
+ALTER TABLE functions.functions ADD COLUMN IF NOT EXISTS runtime text;
 
 CREATE TABLE IF NOT EXISTS functions._code (
     function_id uuid PRIMARY KEY,
@@ -142,7 +172,7 @@ ALTER TABLE functions.secrets ENABLE ROW LEVEL SECURITY;
 
 /// The columns projected for every function metadata read.
 const FUNCTION_COLUMNS: &str =
-    "id, slug, name, verify_jwt, version, status, created_at, updated_at";
+    "id, slug, name, verify_jwt, version, status, runtime, created_at, updated_at";
 
 /// Bootstrap the `functions` schema exactly once per gateway instance.
 pub async fn ensure_schema<S: RelationalStorage + 'static>(
@@ -158,6 +188,109 @@ pub async fn ensure_schema<S: RelationalStorage + 'static>(
         })
         .await
         .map(|_| ())
+}
+
+// ---------------------------------------------------------------------------
+// Runtime detection
+// ---------------------------------------------------------------------------
+
+const WASM_MAGIC: &[u8] = b"\0asm";
+
+/// Which substrate a deployed function body runs under, detected once at
+/// deploy time from the body's content — never a field the caller sets
+/// explicitly. Persisted as the `functions.functions.runtime` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionRuntime {
+    /// A WebAssembly module, run in [`crate::compute::WasmRuntime`] (needs
+    /// the `compute` Cargo feature).
+    Wasm,
+    /// Deno TypeScript/JavaScript source, run by shelling out to a `deno`
+    /// binary (see the `functions_deno` module). Needs no extra Cargo
+    /// feature.
+    Deno,
+}
+
+impl FunctionRuntime {
+    fn as_str(self) -> &'static str {
+        match self {
+            FunctionRuntime::Wasm => "wasm",
+            FunctionRuntime::Deno => "deno",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "wasm" => Some(FunctionRuntime::Wasm),
+            "deno" => Some(FunctionRuntime::Deno),
+            _ => None,
+        }
+    }
+
+    /// The `Content-Type` a deployed body of this runtime renders as on
+    /// `GET .../body`.
+    fn content_type(self) -> &'static str {
+        match self {
+            FunctionRuntime::Wasm => "application/wasm",
+            FunctionRuntime::Deno => "application/typescript",
+        }
+    }
+}
+
+/// `Content-Type` values on `PUT .../body` that mean "this raw body is Deno
+/// source, not base64" — mirrors the existing `application/wasm` /
+/// `application/octet-stream` sniff for raw wasm bytes.
+const DENO_SOURCE_CONTENT_TYPES: &[&str] = &[
+    "application/typescript",
+    "text/typescript",
+    "application/x-typescript",
+    "application/javascript",
+    "text/javascript",
+];
+
+/// Validate a WebAssembly body: the `\0asm` magic and the size ceiling.
+fn validate_wasm_body(bytes: &[u8]) -> Result<(), SupaError> {
+    validate_wasm_magic(bytes)?;
+    if bytes.len() > MAX_WASM_BUNDLE_BYTES {
+        return Err(SupaError::BadRequest(format!(
+            "wasm body exceeds {MAX_WASM_BUNDLE_BYTES} bytes ({} bytes)",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a Deno source body: valid non-empty UTF-8 text under the size
+/// ceiling. This is deliberately light — full syntax validation would need
+/// an embedded JS/TS parser, and a real Deno process already gives an honest
+/// boot-error at invoke time for anything that fails to parse.
+fn validate_deno_body(bytes: &[u8]) -> Result<(), SupaError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| SupaError::BadRequest(format!("function source is not valid UTF-8: {e}")))?;
+    if text.trim().is_empty() {
+        return Err(SupaError::BadRequest("function source is empty".into()));
+    }
+    if bytes.len() > MAX_DENO_SOURCE_BYTES {
+        return Err(SupaError::BadRequest(format!(
+            "function source exceeds {MAX_DENO_SOURCE_BYTES} bytes ({} bytes)",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Detect and validate a deployed body's runtime purely from its content:
+/// the `\0asm` magic means WebAssembly, otherwise it must be non-empty valid
+/// UTF-8 (Deno source) — anything else (binary garbage, empty body) is
+/// rejected. Used wherever the caller hasn't told us the runtime via
+/// `Content-Type` (the base64 `body` field on create/update, and the
+/// `PUT .../body` fallback for an unrecognized content type).
+fn detect_runtime(bytes: &[u8]) -> Result<FunctionRuntime, SupaError> {
+    if bytes.len() >= 4 && &bytes[..4] == WASM_MAGIC {
+        validate_wasm_body(bytes)?;
+        return Ok(FunctionRuntime::Wasm);
+    }
+    validate_deno_body(bytes)?;
+    Ok(FunctionRuntime::Deno)
 }
 
 // ---------------------------------------------------------------------------
@@ -363,28 +496,36 @@ async fn create_function<S: RelationalStorage + 'static>(
             .map_err(|e| SupaError::BadRequest(format!("invalid create body: {e}")))?;
         validate_slug(&req.slug)?;
 
-        let wasm = match req.body.as_deref() {
-            Some(b64) => Some(decode_wasm(b64)?),
-            None => None,
+        let (code, runtime) = match req.body.as_deref() {
+            Some(b64) => {
+                let (bytes, rt) = decode_function_body(b64)?;
+                (Some(bytes), Some(rt))
+            }
+            None => (None, None),
         };
 
         let id = Uuid::new_v4();
         let now = Utc::now();
         let name = req.name.unwrap_or_else(|| req.slug.clone());
-        let status = if wasm.is_some() { "ACTIVE" } else { "PENDING" };
+        let status = if code.is_some() { "ACTIVE" } else { "PENDING" };
+        let runtime_value = match runtime {
+            Some(rt) => SqlValue::Text(rt.as_str().to_string()),
+            None => SqlValue::Null,
+        };
 
         let insert = run_sql_as(
             &state.db,
             &auth,
             "INSERT INTO functions.functions \
-             (id, slug, name, verify_jwt, version, status, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, 1, $5, $6, $6)",
+             (id, slug, name, verify_jwt, version, status, runtime, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, 1, $5, $6, $7, $7)",
             vec![
                 SqlValue::Uuid(id),
                 SqlValue::Text(req.slug.clone()),
                 SqlValue::Text(name),
                 SqlValue::Bool(req.verify_jwt),
                 SqlValue::Text(status.to_string()),
+                runtime_value,
                 SqlValue::Timestamptz(now),
             ],
         )
@@ -399,8 +540,8 @@ async fn create_function<S: RelationalStorage + 'static>(
             return Err(SupaError::Sql(e));
         }
 
-        if let Some(wasm) = wasm {
-            insert_code(&state, &auth, id, &wasm, now).await?;
+        if let Some(code) = code {
+            insert_code(&state, &auth, id, &code, now).await?;
         }
 
         let row = fetch_one_function(&state, &auth, &req.slug).await?;
@@ -448,6 +589,9 @@ async fn update_function<S: RelationalStorage + 'static>(
         };
         let id = extract_id(&existing)?;
         let now = Utc::now();
+
+        let code_and_runtime = req.body.as_deref().map(decode_function_body).transpose()?;
+
         let mut sets = vec!["updated_at = $1".to_string()];
         let mut params: Vec<SqlValue> = vec![SqlValue::Timestamptz(now)];
         if let Some(name) = req.name {
@@ -458,10 +602,11 @@ async fn update_function<S: RelationalStorage + 'static>(
             params.push(SqlValue::Bool(verify));
             sets.push(format!("verify_jwt = ${}", params.len()));
         }
-        let bumps_version = req.body.is_some();
-        if bumps_version {
+        if let Some((_, runtime)) = &code_and_runtime {
             sets.push("version = version + 1".to_string());
             sets.push("status = 'ACTIVE'".to_string());
+            params.push(SqlValue::Text(runtime.as_str().to_string()));
+            sets.push(format!("runtime = ${}", params.len()));
         }
         params.push(SqlValue::Text(slug.clone()));
         let sql = format!(
@@ -473,9 +618,8 @@ async fn update_function<S: RelationalStorage + 'static>(
             .await
             .map_err(SupaError::Sql)?;
 
-        if let Some(b64) = req.body {
-            let wasm = decode_wasm(&b64)?;
-            replace_code(&state, &auth, id, &wasm, now).await?;
+        if let Some((code, _)) = code_and_runtime {
+            replace_code(&state, &auth, id, &code, now).await?;
         }
 
         let row = fetch_one_function(&state, &auth, &slug).await?;
@@ -552,9 +696,10 @@ async fn get_function_body<S: RelationalStorage + 'static>(
                 format!("function \"{slug}\" has no deployed body"),
             ));
         };
+        let runtime = row_runtime(&row);
         Ok((
             StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/wasm")],
+            [(axum::http::header::CONTENT_TYPE, runtime.content_type())],
             bytes,
         )
             .into_response())
@@ -579,40 +724,46 @@ async fn put_function_body<S: RelationalStorage + 'static>(
             ));
         };
         let id = extract_id(&row)?;
-        // Accept either raw application/wasm bytes or base64 in a text body.
+        // Accept raw application/wasm bytes, raw Deno source text (several
+        // equivalent content types), or base64 text that gets sniffed.
         let content_type = headers
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let wasm = if content_type.starts_with("application/wasm")
+        let (code, runtime) = if content_type.starts_with("application/wasm")
             || content_type.starts_with("application/octet-stream")
         {
-            body.to_vec()
+            let bytes = body.to_vec();
+            validate_wasm_body(&bytes)?;
+            (bytes, FunctionRuntime::Wasm)
+        } else if DENO_SOURCE_CONTENT_TYPES
+            .iter()
+            .any(|ct| content_type.starts_with(ct))
+        {
+            let bytes = body.to_vec();
+            validate_deno_body(&bytes)?;
+            (bytes, FunctionRuntime::Deno)
         } else {
             let text = std::str::from_utf8(&body).map_err(|_| {
-                SupaError::BadRequest("body must be application/wasm or base64 text".into())
+                SupaError::BadRequest(
+                    "body must be application/wasm, Deno source text, or base64 text".into(),
+                )
             })?;
-            decode_wasm(text.trim())?
+            decode_function_body(text.trim())?
         };
-        if wasm.len() > MAX_WASM_BUNDLE_BYTES {
-            return Ok(functions_error(
-                FunctionsErrorCode::BadRequest,
-                format!(
-                    "wasm body exceeds {MAX_WASM_BUNDLE_BYTES} bytes ({} bytes)",
-                    wasm.len()
-                ),
-            ));
-        }
-        validate_wasm_magic(&wasm)?;
         let now = Utc::now();
-        replace_code(&state, &auth, id, &wasm, now).await?;
+        replace_code(&state, &auth, id, &code, now).await?;
         run_sql_as(
             &state.db,
             &auth,
             "UPDATE functions.functions \
-             SET version = version + 1, status = 'ACTIVE', updated_at = $1 \
-             WHERE slug = $2",
-            vec![SqlValue::Timestamptz(now), SqlValue::Text(slug.clone())],
+             SET version = version + 1, status = 'ACTIVE', runtime = $1, updated_at = $2 \
+             WHERE slug = $3",
+            vec![
+                SqlValue::Text(runtime.as_str().to_string()),
+                SqlValue::Timestamptz(now),
+                SqlValue::Text(slug.clone()),
+            ],
         )
         .await
         .map_err(SupaError::Sql)?;
@@ -846,7 +997,8 @@ async fn invoke_function<S: RelationalStorage + 'static>(
             ));
         }
         let id = extract_id(&row)?;
-        let Some(wasm) = load_code(&state, &admin_auth, id).await? else {
+        let runtime = row_runtime(&row);
+        let Some(code) = load_code(&state, &admin_auth, id).await? else {
             return Ok(functions_error(
                 FunctionsErrorCode::NotFound,
                 format!("function \"{slug}\" has no deployed body"),
@@ -893,15 +1045,49 @@ async fn invoke_function<S: RelationalStorage + 'static>(
             jwt,
         };
 
-        let output = run_guest(&wasm, &input).await?;
+        let output = run_guest(runtime, &code, &input).await?;
 
         render_output(output)
     })
     .await
 }
 
-/// The result of running a guest, before it becomes an HTTP response.
-async fn run_guest(wasm: &[u8], input: &InvocationInput) -> Result<InvocationOutput, SupaError> {
+/// Dispatch a guest invocation to the substrate its deployed body was
+/// detected as at deploy time. Both branches ultimately produce the same
+/// `SupaError::Internal("__functions_{boot,runtime}::...")` shape that
+/// [`functions_error_from`] classifies into the right typed
+/// `SUPA_COMPAT_FUNCTION_*` code — the invocation surface doesn't need to
+/// know which substrate ran.
+async fn run_guest(
+    runtime: FunctionRuntime,
+    code: &[u8],
+    input: &InvocationInput,
+) -> Result<InvocationOutput, SupaError> {
+    match runtime {
+        FunctionRuntime::Wasm => run_wasm_guest(code, input).await,
+        FunctionRuntime::Deno => crate::supabase::functions_deno::run_deno_guest(
+            code,
+            input,
+            DEFAULT_TIMEOUT_MS,
+            DEFAULT_MEMORY_BYTES,
+        )
+        .await
+        .map_err(guest_error_to_supa),
+    }
+}
+
+fn guest_error_to_supa(e: GuestError) -> SupaError {
+    match e {
+        GuestError::Boot(msg) => SupaError::Internal(format!("__functions_boot::{msg}")),
+        GuestError::Runtime(msg) => SupaError::Internal(format!("__functions_runtime::{msg}")),
+    }
+}
+
+/// The result of running a WASM guest, before it becomes an HTTP response.
+async fn run_wasm_guest(
+    wasm: &[u8],
+    input: &InvocationInput,
+) -> Result<InvocationOutput, SupaError> {
     let input_bytes = serde_cbor_to_bytes(input)?;
     let wasm = wasm.to_vec();
     // The guardian compute runtime is synchronous and CPU-bound; run it in
@@ -912,27 +1098,18 @@ async fn run_guest(wasm: &[u8], input: &InvocationInput) -> Result<InvocationOut
     .await
     .map_err(|e| SupaError::Internal(format!("guest runner join error: {e}")))?;
 
-    let bytes = match joined {
-        Ok(bytes) => bytes,
-        Err(GuestError::Boot(msg)) => {
-            return Err(SupaError::Internal(format!("__functions_boot::{msg}")));
-        }
-        Err(GuestError::Runtime(msg)) => {
-            return Err(SupaError::Internal(format!("__functions_runtime::{msg}")));
-        }
-    };
+    let bytes = joined.map_err(guest_error_to_supa)?;
 
-    let out: InvocationOutput = serde_cbor_from_bytes(&bytes)
-        .map_err(|e| SupaError::Internal(format!("__functions_runtime::invalid output: {e}")))?;
+    let out: InvocationOutput = serde_cbor_from_bytes(&bytes)?;
     Ok(out)
 }
 
 /// Errors distinguishing boot-time (compile/instantiate/missing export) from
 /// runtime (trap/deadline/fuel/etc.), so the invocation surface can render
-/// the correct `SUPA_COMPAT_FUNCTION_*` code.
+/// the correct `SUPA_COMPAT_FUNCTION_*` code. Shared by both the WASM and
+/// Deno substrates (see the `functions_deno` module).
 #[derive(Debug)]
-#[allow(dead_code)]
-enum GuestError {
+pub(crate) enum GuestError {
     Boot(String),
     Runtime(String),
 }
@@ -994,14 +1171,16 @@ fn run_guest_blocking(
 
 fn render_output(output: InvocationOutput) -> Result<Response, SupaError> {
     let status = StatusCode::from_u16(output.status).map_err(|_| {
-        SupaError::Internal(format!("_functions_runtime::bad status {}", output.status))
+        SupaError::Internal(format!("__functions_runtime::bad status {}", output.status))
     })?;
     let body_bytes = if output.body_b64.is_empty() {
         Vec::new()
     } else {
         base64::engine::general_purpose::STANDARD
             .decode(output.body_b64.as_bytes())
-            .map_err(|e| SupaError::Internal(format!("_functions_runtime::bad body base64: {e}")))?
+            .map_err(|e| {
+                SupaError::Internal(format!("__functions_runtime::bad body base64: {e}"))
+            })?
     };
     let mut response = (status, body_bytes).into_response();
     for (k, v) in output.headers {
@@ -1183,6 +1362,16 @@ fn extract_bool(row: &Json, key: &str) -> Option<bool> {
     row.get(key).and_then(Json::as_bool)
 }
 
+/// The row's `runtime`, defaulting to [`FunctionRuntime::Wasm`] when absent
+/// — a NULL/missing column means the row predates Deno-runtime support (see
+/// the `BOOTSTRAP_SQL` migration note), and wasm was the only substrate then.
+fn row_runtime(row: &Json) -> FunctionRuntime {
+    row.get("runtime")
+        .and_then(Json::as_str)
+        .and_then(FunctionRuntime::parse)
+        .unwrap_or(FunctionRuntime::Wasm)
+}
+
 // ---------------------------------------------------------------------------
 // Small utilities
 // ---------------------------------------------------------------------------
@@ -1233,22 +1422,17 @@ fn validate_secret_name(name: &str) -> Result<(), SupaError> {
     }
 }
 
-fn decode_wasm(b64: &str) -> Result<Vec<u8>, SupaError> {
+/// Base64-decode a deployed body and detect+validate its runtime from the
+/// decoded bytes (see [`detect_runtime`]).
+fn decode_function_body(b64: &str) -> Result<(Vec<u8>, FunctionRuntime), SupaError> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.as_bytes())
-        .map_err(|e| SupaError::BadRequest(format!("wasm body is not valid base64: {e}")))?;
-    if bytes.len() > MAX_WASM_BUNDLE_BYTES {
-        return Err(SupaError::BadRequest(format!(
-            "wasm body exceeds {MAX_WASM_BUNDLE_BYTES} bytes ({} bytes)",
-            bytes.len()
-        )));
-    }
-    validate_wasm_magic(&bytes)?;
-    Ok(bytes)
+        .map_err(|e| SupaError::BadRequest(format!("body is not valid base64: {e}")))?;
+    let runtime = detect_runtime(&bytes)?;
+    Ok((bytes, runtime))
 }
 
 fn validate_wasm_magic(bytes: &[u8]) -> Result<(), SupaError> {
-    const WASM_MAGIC: &[u8] = b"\0asm";
     if bytes.len() < 8 || &bytes[..4] != WASM_MAGIC {
         return Err(SupaError::BadRequest(
             "body is not a WebAssembly module (missing \\0asm magic)".into(),
@@ -1289,13 +1473,13 @@ fn bearer_from(headers: &HeaderMap) -> Option<String> {
 fn serde_cbor_to_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, SupaError> {
     let mut out = Vec::with_capacity(256);
     ciborium::ser::into_writer(value, &mut out)
-        .map_err(|e| SupaError::Internal(format!("_functions_runtime::cbor encode: {e}")))?;
+        .map_err(|e| SupaError::Internal(format!("__functions_runtime::cbor encode: {e}")))?;
     Ok(out)
 }
 
 fn serde_cbor_from_bytes<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, SupaError> {
     ciborium::de::from_reader(bytes)
-        .map_err(|e| SupaError::Internal(format!("_functions_runtime::cbor decode: {e}")))
+        .map_err(|e| SupaError::Internal(format!("__functions_runtime::cbor decode: {e}")))
 }
 
 // ---------------------------------------------------------------------------

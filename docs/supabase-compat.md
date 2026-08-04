@@ -8,9 +8,11 @@ GuardianDB-specific code. It lives entirely behind the `supabase` Cargo feature
 Implemented end-to-end: **REST** (PostgREST-compatible), **Auth**
 (GoTrue-compatible), **Storage** (storage-api-compatible), **postgres-meta**
 (the API Supabase Studio talks to), **Realtime** (Phoenix-protocol
-websocket: postgres_changes + broadcast), and **GraphQL**
-(pg_graphql-compatible reflection of the `public` schema). The remaining Kong
-service (**functions**) returns a typed `501` — never a bare 404 and never
+websocket: postgres_changes + broadcast), **GraphQL**
+(pg_graphql-compatible reflection of the `public` schema), and **Functions**
+(Supabase Edge Functions-compatible, with *two* runtime substrates — a
+WebAssembly sandbox and a real Deno subprocess, see §3 below). Every route
+this layer doesn't cover returns a typed error — never a bare 404 and never
 fake success.
 
 ---
@@ -63,7 +65,7 @@ HTTP request
   ├─ /pg-meta/*        → pg_meta.rs  → catalog + pg_catalog views (service_role-gated)
   ├─ /platform/pg-meta → alias of /pg-meta
   ├─ /realtime/v1/websocket → realtime.rs → Phoenix ws (apikey via query param)
-  └─ /functions → 501 typed
+  └─ /functions/v1/*   → functions.rs → wasm sandbox | deno subprocess (runtime detected at deploy)
 ```
 
 Files (all under `src/supabase/`, behind `#[cfg(feature = "supabase")]`):
@@ -78,6 +80,11 @@ Files (all under `src/supabase/`, behind `#[cfg(feature = "supabase")]`):
 - `storage.rs` — storage-api bucket/object handlers over the `storage` schema.
 - `pg_meta.rs` — postgres-meta endpoints (what Studio needs).
 - `realtime.rs` — Phoenix-protocol websocket (postgres_changes + broadcast).
+- `functions.rs` — Edge Functions admin CRUD + invocation dispatch, runtime
+  detection (`\0asm` magic vs. UTF-8 source).
+- `functions_deno.rs` — the Deno subprocess runner (permissions, env
+  isolation, timeouts); `functions_deno_harness.ts` is the guest-side script
+  it runs, embedded at compile time.
 - `src/bin/guardian-supabase.rs` — the binary.
 
 A single project is served per gateway instance (the "single-project shell"),
@@ -369,12 +376,86 @@ an in-band GraphQL error):
 - engine note: insert coercion routes integers through `f64`, so `bigint`
   values beyond 2⁵³ lose precision engine-wide (REST and GraphQL alike).
 
-### Not implemented in this slice → typed `501`
+### Functions (`/functions/v1`)
 
-`/functions/v1/*` returns
-`{"code":"SUPA_COMPAT_FUNCTIONS_NOT_IMPLEMENTED","message":"…","hint":"tracked for a later slice"}`
-with HTTP `501` — functions would need a Deno/edge runtime. `/health` returns
-`200 {"status":"ok"}`.
+Two runtime substrates, picked automatically from what gets deployed — never
+a field the caller sets:
+
+| Body starts with | Runtime | Executes via |
+| --- | --- | --- |
+| the `\0asm` magic | `wasm` | [`crate::compute::WasmRuntime`] — needs the `compute` Cargo feature (pulls in `wasmtime`). |
+| anything else, if valid non-empty UTF-8 | `deno` | a `deno` binary on `PATH` (or `$GDB_DENO_PATH`) — **no extra Cargo feature**, this is what lets a project ship an ordinary Deno function without ever touching WebAssembly. |
+
+Anything that is neither (binary garbage, empty body) is a typed `400` at
+deploy time.
+
+**Admin (`/_admin/...`, `service_role` only)** — mirrors Supabase's CLI flow
+(`supabase functions deploy|list|delete`):
+
+| Method | Path | Behaviour |
+| --- | --- | --- |
+| `POST` | `/_admin/functions` | `{slug, name?, verify_jwt? (default true), body?}` — `body` is base64; a slug can be reserved with no body (`status: "PENDING"`) and the body `PUT` separately. |
+| `GET` | `/_admin/functions` | List, ordered by slug. |
+| `GET`/`PATCH`/`DELETE` | `/_admin/functions/{slug}` | Get / update name·verify_jwt·body (bumps `version`, sets `status: "ACTIVE"`) / delete (cascades code + secrets). |
+| `GET`/`PUT` | `/_admin/functions/{slug}/body` | Fetch the raw deployed body (`Content-Type: application/wasm` or `application/typescript`) / deploy a new one. `PUT` accepts raw `application/wasm` bytes, raw Deno source (`Content-Type` one of `application/typescript`, `text/typescript`, `application/x-typescript`, `application/javascript`, `text/javascript`), or base64 text (runtime auto-detected either way). |
+| `GET`/`POST`/`DELETE` | `/_admin/functions/{slug}/secrets` | List names (values never surface) / upsert `{name, value}` / delete all. |
+| `DELETE` | `/_admin/functions/{slug}/secrets/{name}` | Delete one. |
+
+**Invocation (`/{slug}`)** — `GET`/`POST`/`PUT`/`PATCH`/`DELETE` plus the CORS
+`OPTIONS` preflight (204, answered without touching the DB). `verify_jwt`
+(the CLI's `--no-verify-jwt` toggle, default `true`) governs whether a
+missing `Authorization: Bearer` is rejected before the function ever runs.
+Both runtimes see the same [`InvocationInput`]/[`InvocationOutput`] envelope
+(method, url, headers, base64 body, resolved role, request id, per-function
+secrets) — just over a different transport:
+
+- **wasm**: CBOR through the guest's linear memory. The module exports
+  `gdb_alloc(len) -> ptr` and `handler(ptr, len) -> i64` (packed
+  `(out_ptr << 32) | out_len`); a fresh `Store` per invocation, the only
+  linked-in host capability is `gdb.log`.
+- **deno**: JSON over a child process's stdin/stdout. A **fresh subprocess
+  per invocation** (no warm pool — the same isolation trade-off as the wasm
+  path's fresh `Store`, and the same class of cost as this project's other
+  supervised-child-process runtimes, e.g. `compute-llm-colibri`) runs an
+  embedded harness script that imports the deployed function, intercepts
+  `Deno.serve` to capture the handler instead of binding a port (a bare
+  `export default (req) => new Response(...)` also works, as a fallback),
+  builds a real `Request` from the envelope, and writes the `Response` back
+  as JSON. `console.*` is redirected to stderr and forwarded into
+  GuardianDB's `tracing` — the `gdb.log` equivalent for this runtime.
+  Permissions are least-privilege and explicit, never ambient: `--allow-net`
+  (outbound `fetch`, matching real Supabase Edge Functions — that's usually
+  the whole point of one), `--allow-env` scoped to exactly the function's
+  own `functions.secrets` names (nothing else — the child's process
+  environment is `env_clear()`'d and rebuilt from scratch), and
+  `--allow-read`/`--allow-write` scoped to a per-invocation scratch
+  directory plus the shared Deno module cache. No `--allow-run`,
+  `--allow-ffi`, or `--allow-sys`, ever. Wall-clock is bounded by a
+  `tokio::time::timeout` that kills the child on expiry; memory is bounded
+  (best-effort, V8's heap rather than an OS cgroup) via
+  `--v8-flags=--max-old-space-size`.
+
+Both ceilings default to Supabase's own Edge Functions defaults: 60s
+wall-clock, 128 MiB.
+
+**Errors** match Supabase's Functions runtime shape —
+`{"error": <code>, "msg": <message>}` — with a boot/runtime split that both
+substrates render the same way: `SUPA_COMPAT_FUNCTION_BOOT_ERROR` (module
+failed to compile/instantiate/import, or no `handler` export / no
+`Deno.serve`/default-export handler found) vs.
+`SUPA_COMPAT_FUNCTION_RUNTIME_ERROR` (trap, thrown exception, deadline,
+fuel/memory exhaustion, malformed guest output). `SUPA_COMPAT_FUNCTION_NOT_FOUND`
+(unknown slug or no deployed body), `_BAD_REQUEST` (bad slug/secret
+name/deploy body), `_FORBIDDEN` (admin route without `service_role`, or
+`verify_jwt=true` without a bearer token), and `_INVALID_WASM` round out the
+taxonomy.
+
+**Known trade-offs** (all honestly typed-error, never silent): single-file
+functions only — no eszip bundler, so a deployed Deno function can't
+`import` sibling local files, only remote URL/`npm:`/`jsr:` specifiers
+(cached across invocations under a shared `DENO_DIR`). No warm pool for
+either runtime. `--allow-net` is unscoped (no per-function host allowlist
+yet). `/health` returns `200 {"status":"ok"}`.
 
 ---
 
@@ -532,7 +613,10 @@ bad password/refresh token). OAuth/SSO grants (`id_token`, `authorization_code`,
 
 ## 7. Deferred to later slices
 
-- **Edge Functions.** Routed and returning typed `501`; not implemented.
+- **Edge Functions.** Implemented for both runtimes (§3), with real
+  trade-offs still open: no eszip bundler (single-file functions only, no
+  local sibling imports), no warm process pool for either substrate,
+  `--allow-net` isn't scoped to a per-function host allowlist.
 - **GraphQL**: views, pg_graphql function support, computed columns,
   subscriptions, comment-directive configuration (inflection/renames),
   order-aware cursors (see §3 GraphQL divergences).
@@ -633,6 +717,7 @@ cargo test --features supabase                       # everything
 cargo test --features supabase --test supabase_gateway   # in-process gateway tests
 cargo test --features supabase --test supabase_storage_realtime # storage + pg-meta + realtime
 cargo test --features supabase --test supabase_graphql   # pg_graphql-compatible endpoint
+cargo test --features supabase --test supabase_functions # functions: admin CRUD + both runtimes
 cargo test --features supabase --lib supabase::          # unit tests
 ```
 
@@ -640,3 +725,7 @@ The REST/Auth/Storage/pg-meta integration tests drive the axum `Router`
 in-process with `tower::ServiceExt::oneshot` over a `MemoryStorage`-backed
 `Database` — no real ports are bound. The realtime tests bind an ephemeral
 `127.0.0.1` port and connect a real websocket client (`tokio-tungstenite`).
+The Functions suite's WASM end-to-end tests need `--features supabase,compute`
+to compile in; its Deno end-to-end tests compile in either way but shell out
+to a real `deno` binary on `PATH` at runtime, skipping (not failing) if one
+isn't found — CI installs Deno for exactly this (`.github/workflows/rust.yml`).
